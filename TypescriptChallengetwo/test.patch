@@ -22,7 +22,7 @@ new file mode 100644
 index 0000000..61684fb
 --- /dev/null
 +++ b/tests/test_throthling/test_advanced_throttling.py
-@@ -0,0 +1,1330 @@
+@@ -0,0 +1,1379 @@
 +import math
 +import uuid
 +from contextlib import contextmanager
@@ -84,6 +84,37 @@ index 0000000..61684fb
 +        for _ in range(10):
 +            assert throttle.allow_request(request) is True
 +        assert throttle.allow_request(request) is False
++
++    def test_token_bucket_construction_no_raise_without_scope_in_rates(self):
++        from ninja_extra.throttling import TokenBucketThrottle
++
++        class OrphanScope(TokenBucketThrottle):
++            scope = "not_in_throttle_rates_at_all"
++
++            def get_cache_key(self, request):
++                return "orphan_key"
++
++        throttle = OrphanScope(rate=None)
++        assert throttle is not None
++
++    def test_token_bucket_period_aliases_s_h_d_day(self):
++        from ninja_extra.throttling import TokenBucketThrottle
++
++        class AliasBucket(TokenBucketThrottle):
++            scope = "test_alias"
++
++            def get_cache_key(self, request):
++                return "alias_" + str(id(self))
++
++        request = HttpRequest()
++        request.META["REMOTE_ADDR"] = "1.0.0.2"
++
++        for rate_str, capacity in [("3/s", 3), ("3/h", 3), ("3/d", 3), ("3/day", 3)]:
++            cache.clear()
++            throttle = AliasBucket(rate=rate_str)
++            for _ in range(capacity):
++                assert throttle.allow_request(request) is True
++            assert throttle.allow_request(request) is False
 +
 +
 +class TestTokenBucketBasicBehavior:
@@ -604,6 +635,24 @@ index 0000000..61684fb
 +        assert key_a is not None
 +        assert key_b is not None
 +        assert key_a != key_b
++
++    def test_concurrent_base_falls_back_to_ip_for_anonymous(self):
++        from ninja_extra.throttling import ConcurrentRateThrottle
++
++        throttle = ConcurrentRateThrottle(max_concurrent=2)
++        req_anon = HttpRequest()
++        req_anon.user = None
++        req_anon.META["REMOTE_ADDR"] = "55.55.55.55"
++
++        key = throttle.get_cache_key(req_anon)
++        assert key is not None
++
++        req_anon2 = HttpRequest()
++        req_anon2.user = None
++        req_anon2.META["REMOTE_ADDR"] = "55.55.55.56"
++        key2 = throttle.get_cache_key(req_anon2)
++        assert key2 is not None
++        assert key != key2
 +
 +
 +class TestConcurrentBasicBehavior:
