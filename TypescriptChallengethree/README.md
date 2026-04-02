@@ -1,0 +1,12 @@
+Repository
+https://github.com/final-form/final-form
+Commit: 8e873adf47e07b56c8df0271e5ef1fdec24ba9ab
+
+Title
+Computed Derived Fields with Dependency Graph and Lazy Memoized Evaluation
+
+The form API must support a registerComputedField(name, config) method where config contains a compute function (receiving current form values, returning the derived value) and a dependsOn string array listing field names whose values trigger recomputation; the returned unsubscribe function must remove the computed field and clean up all dependency tracking, and calling change() on a computed field must throw an Error with a message containing "computed".
+Computed field values must be injected into form state values (getState().values) and kept synchronized: whenever any field listed in dependsOn changes value (via change(), initialize(), reset(), restart(), or mutators), the compute function must be re-invoked and the computed field's value in form state must update before any subscriber notifications fire; compute functions must be memoized so that if all dependency values are referentially identical to the previous invocation, the compute function is not called again.
+Computed fields must fully participate in the subscription system: they must be subscribable via registerField with all standard FieldSubscription keys (value, dirty, pristine, error, valid, etc.), and their state changes must trigger both field-level and form-level subscriber notifications; computed fields must also participate in form-level validation (both record-level validate and field-level getValidator), with errors surfaced through standard error/valid/invalid channels.
+Computed fields must support transitive dependencies (computed field A depends on computed field B which depends on regular field C); evaluation order must follow topological sort so that B recomputes before A when C changes; circular dependencies must be detected at registration time and throw an Error with a message containing "circular"; when a dependency field is unregistered (with destroyOnUnregister true), the computed field must receive undefined for that dependency's value in subsequent computations.
+registerComputedField must accept an optional excludeFromSubmit boolean (defaulting to false); when true, the computed field's value must be stripped from the values object passed to onSubmit while still being visible in getState().values and to subscribers; batch() must coalesce multiple dependency changes so that compute functions execute at most once per batch for each computed field.

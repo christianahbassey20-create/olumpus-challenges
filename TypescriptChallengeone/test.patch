@@ -1,0 +1,1278 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..9120ca2
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,13 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++MODE="${1:-new}"
++
++if [ "$MODE" = "base" ]; then
++  python -m pytest --ignore=tests/test_model_controller/test_bulk_operations.py -x --tb=short
++elif [ "$MODE" = "new" ]; then
++  python -m pytest tests/test_model_controller/test_bulk_operations.py -x --tb=short
++else
++  echo "Usage: $0 [base|new]" >&2
++  exit 1
++fi
+diff --git a/tests/test_model_controller/test_bulk_operations.py b/tests/test_model_controller/test_bulk_operations.py
+new file mode 100644
+index 0000000..44b2ba9
+--- /dev/null
++++ b/tests/test_model_controller/test_bulk_operations.py
+@@ -0,0 +1,1253 @@
++import typing as t
++import pytest
++from ninja_schema import ModelSchema
++
++from ninja_extra import (
++    ModelConfig,
++    ModelControllerBase,
++    ModelEndpointFactory,
++    ModelSchemaConfig,
++    api_controller,
++)
++from ninja_extra.controllers.model.schemas import (
++    BulkItemResult,
++    BulkOperationConfig,
++    BulkOperationError,
++    BulkOperationResponse,
++)
++from ninja_extra.testing import TestClient, TestAsyncClient
++
++from ..models import Event
++
++
++class CreateEventSchema(ModelSchema):
++    class Config:
++        model = Event
++        include = ["title", "start_date", "end_date"]
++
++
++class PatchEventSchema(ModelSchema):
++    class Config:
++        model = Event
++        include = ["title", "start_date", "end_date"]
++        optional = ["title", "start_date", "end_date"]
++
++
++class EventSchema(ModelSchema):
++    class Config:
++        model = Event
++        exclude = ["category"]
++
++
++# ── Controller with atomic bulk (default) ──────────────────
++@api_controller("/events-bulk-atomic")
++class EventBulkAtomicController(ModelControllerBase):
++    model_config = ModelConfig(
++        model=Event,
++        allowed_routes=["create", "find_one", "list", "bulk_create", "bulk_update", "bulk_patch", "bulk_delete"],
++        create_schema=CreateEventSchema,
++        retrieve_schema=EventSchema,
++        update_schema=CreateEventSchema,
++        patch_schema=PatchEventSchema,
++        pagination=None,
++        bulk_config=BulkOperationConfig(atomic=True, max_items=5),
++    )
++
++
++# ── Controller with non-atomic bulk ────────────────────────
++@api_controller("/events-bulk-nonatomic")
++class EventBulkNonAtomicController(ModelControllerBase):
++    model_config = ModelConfig(
++        model=Event,
++        allowed_routes=["create", "find_one", "list", "bulk_create", "bulk_update", "bulk_patch", "bulk_delete"],
++        create_schema=CreateEventSchema,
++        retrieve_schema=EventSchema,
++        update_schema=CreateEventSchema,
++        patch_schema=PatchEventSchema,
++        pagination=None,
++        bulk_config=BulkOperationConfig(atomic=False, max_items=50),
++    )
++
++
++# ── Async controller with bulk ──────────────────────────────
++@api_controller("/events-bulk-async")
++class EventBulkAsyncController(ModelControllerBase):
++    model_config = ModelConfig(
++        model=Event,
++        async_routes=True,
++        allowed_routes=["create", "find_one", "list", "bulk_create", "bulk_update", "bulk_patch", "bulk_delete"],
++        create_schema=CreateEventSchema,
++        retrieve_schema=EventSchema,
++        update_schema=CreateEventSchema,
++        patch_schema=PatchEventSchema,
++        pagination=None,
++        bulk_config=BulkOperationConfig(atomic=True, max_items=10),
++    )
++
++
++# ── Controller using custom bulk endpoints via factory ──────
++@api_controller("/events-bulk-custom")
++class EventBulkCustomController(ModelControllerBase):
++    model_config = ModelConfig(
++        model=Event,
++        allowed_routes=[],
++        create_schema=CreateEventSchema,
++        retrieve_schema=EventSchema,
++        update_schema=CreateEventSchema,
++        patch_schema=PatchEventSchema,
++        pagination=None,
++    )
++
++    bulk_create_events = ModelEndpointFactory.bulk_create(
++        schema_in=CreateEventSchema,
++        path="/bulk",
++        atomic=False,
++        max_items=3,
++    )
++
++    bulk_delete_events = ModelEndpointFactory.bulk_delete(
++        path="/bulk/delete",
++        pk_type=int,
++        lookup_param="id",
++        atomic=False,
++        max_items=10,
++    )
++
++
++# ── Controller using factory update/patch endpoints (sync) ──
++@api_controller("/events-bulk-factory-upd")
++class EventBulkFactoryUpdatePatchController(ModelControllerBase):
++    model_config = ModelConfig(
++        model=Event,
++        allowed_routes=[],
++        create_schema=CreateEventSchema,
++        retrieve_schema=EventSchema,
++        update_schema=CreateEventSchema,
++        patch_schema=PatchEventSchema,
++        pagination=None,
++    )
++
++    bulk_update_events = ModelEndpointFactory.bulk_update(
++        path="/bulk",
++        lookup_param="id",
++        schema_in=CreateEventSchema,
++        pk_type=int,
++        atomic=False,
++        max_items=5,
++    )
++
++    bulk_patch_events = ModelEndpointFactory.bulk_patch(
++        path="/bulk",
++        lookup_param="id",
++        schema_in=PatchEventSchema,
++        pk_type=int,
++        atomic=False,
++        max_items=5,
++    )
++
++
++# ── Controller to test non-default lookup_param ────────────
++@api_controller("/events-bulk-title-lookup")
++class EventBulkTitleLookupController(ModelControllerBase):
++    model_config = ModelConfig(
++        model=Event,
++        allowed_routes=[],
++        create_schema=CreateEventSchema,
++        retrieve_schema=EventSchema,
++        update_schema=CreateEventSchema,
++        patch_schema=PatchEventSchema,
++        pagination=None,
++    )
++
++    bulk_update_events = ModelEndpointFactory.bulk_update(
++        path="/bulk",
++        lookup_param="title",
++        schema_in=CreateEventSchema,
++        pk_type=str,
++        atomic=False,
++        max_items=10,
++    )
++
++    bulk_patch_events = ModelEndpointFactory.bulk_patch(
++        path="/bulk",
++        lookup_param="title",
++        schema_in=PatchEventSchema,
++        pk_type=str,
++        atomic=False,
++        max_items=10,
++    )
++
++    bulk_delete_events = ModelEndpointFactory.bulk_delete(
++        path="/bulk/delete",
++        pk_type=str,
++        lookup_param="title",
++        atomic=False,
++        max_items=10,
++    )
++
++
++# ── Controller with BulkOperationConfig AND factory overrides ──
++@api_controller("/events-bulk-override")
++class EventBulkOverrideController(ModelControllerBase):
++    model_config = ModelConfig(
++        model=Event,
++        allowed_routes=[],
++        create_schema=CreateEventSchema,
++        retrieve_schema=EventSchema,
++        update_schema=CreateEventSchema,
++        patch_schema=PatchEventSchema,
++        pagination=None,
++        bulk_config=BulkOperationConfig(atomic=True, max_items=50),
++    )
++
++    bulk_create_events = ModelEndpointFactory.bulk_create(
++        schema_in=CreateEventSchema,
++        path="/bulk",
++        atomic=False,
++        max_items=2,
++    )
++
++    bulk_delete_events = ModelEndpointFactory.bulk_delete(
++        path="/bulk/delete",
++        pk_type=int,
++        lookup_param="id",
++        atomic=False,
++        max_items=10,
++    )
++
++
++# ── Controller with auto-registration defaults (no bulk_config) ──
++@api_controller("/events-bulk-defaults")
++class EventBulkDefaultsController(ModelControllerBase):
++    model_config = ModelConfig(
++        model=Event,
++        allowed_routes=["bulk_create", "bulk_update", "bulk_patch", "bulk_delete"],
++        create_schema=CreateEventSchema,
++        retrieve_schema=EventSchema,
++        update_schema=CreateEventSchema,
++        patch_schema=PatchEventSchema,
++        pagination=None,
++    )
++
++
++# ══════════════════════════════════════════════════════════════
++# TESTS
++# ══════════════════════════════════════════════════════════════
++
++
++@pytest.mark.django_db
++class TestBulkCreateAtomic:
++    """Bulk create with atomic=True: all-or-nothing semantics."""
++
++    def test_bulk_create_success_returns_response_shape(self):
++        client = TestClient(EventBulkAtomicController)
++        items = [
++            {"title": "E1", "start_date": "2024-01-01", "end_date": "2024-01-02"},
++            {"title": "E2", "start_date": "2024-02-01", "end_date": "2024-02-02"},
++        ]
++        res = client.post("/bulk", json=items)
++        assert res.status_code == 200
++        body = res.json()
++        assert body["total"] == 2
++        assert body["succeeded"] == 2
++        assert body["failed"] == 0
++        assert len(body["results"]) == 2
++        for i, r in enumerate(body["results"]):
++            assert r["index"] == i
++            assert r["success"] is True
++            assert r["status_code"] == 201
++
++    def test_bulk_create_items_persisted_in_db(self):
++        client = TestClient(EventBulkAtomicController)
++        items = [
++            {"title": "Persisted1", "start_date": "2024-03-01", "end_date": "2024-03-02"},
++            {"title": "Persisted2", "start_date": "2024-04-01", "end_date": "2024-04-02"},
++        ]
++        res = client.post("/bulk", json=items)
++        assert res.status_code == 200
++        assert Event.objects.filter(title="Persisted1").exists()
++        assert Event.objects.filter(title="Persisted2").exists()
++
++    def test_bulk_create_invalid_item_rejects_entire_request(self):
++        """A schema-invalid item in the list causes pydantic to reject the whole request."""
++        client = TestClient(EventBulkAtomicController)
++        items = [
++            {"title": "GoodItem", "start_date": "2024-05-01", "end_date": "2024-05-02"},
++            {"title": "X" * 200, "start_date": "2024-06-01", "end_date": "2024-06-02"},
++        ]
++        res = client.post("/bulk", json=items)
++        assert res.status_code == 422
++        assert not Event.objects.filter(title="GoodItem").exists()
++
++    def test_bulk_create_max_items_enforced(self):
++        client = TestClient(EventBulkAtomicController)
++        items = [
++            {"title": f"Item{i}", "start_date": "2024-01-01", "end_date": "2024-01-02"}
++            for i in range(6)
++        ]
++        res = client.post("/bulk", json=items)
++        assert res.status_code == 400
++
++    def test_bulk_create_empty_list(self):
++        client = TestClient(EventBulkAtomicController)
++        res = client.post("/bulk", json=[])
++        assert res.status_code == 200
++        body = res.json()
++        assert body["total"] == 0
++        assert body["succeeded"] == 0
++        assert body["failed"] == 0
++        assert body["results"] == []
++
++
++@pytest.mark.django_db
++class TestBulkCreateNonAtomic:
++    """Bulk create with atomic=False: partial success mode."""
++
++    def test_non_atomic_all_succeed(self):
++        client = TestClient(EventBulkNonAtomicController)
++        items = [
++            {"title": "NonAt1", "start_date": "2024-07-01", "end_date": "2024-07-02"},
++            {"title": "NonAt2", "start_date": "2024-08-01", "end_date": "2024-08-02"},
++            {"title": "NonAt3", "start_date": "2024-09-01", "end_date": "2024-09-02"},
++        ]
++        res = client.post("/bulk", json=items)
++        assert res.status_code == 200
++        body = res.json()
++        assert body["total"] == 3
++        assert body["succeeded"] == 3
++        assert body["failed"] == 0
++        assert Event.objects.filter(title="NonAt1").exists()
++        assert Event.objects.filter(title="NonAt2").exists()
++        assert Event.objects.filter(title="NonAt3").exists()
++
++
++@pytest.mark.django_db
++class TestBulkUpdate:
++    """Bulk update operations (PUT semantics)."""
++
++    def _create_events(self, count=3):
++        events = []
++        for i in range(count):
++            e = Event.objects.create(
++                title=f"BulkUpd{i}", start_date="2024-01-01", end_date="2024-01-02"
++            )
++            events.append(e)
++        return events
++
++    def test_bulk_update_success(self):
++        events = self._create_events(2)
++        client = TestClient(EventBulkAtomicController)
++        payload = [
++            {"id": events[0].id, "title": "Updated0", "start_date": "2025-01-01", "end_date": "2025-01-02"},
++            {"id": events[1].id, "title": "Updated1", "start_date": "2025-02-01", "end_date": "2025-02-02"},
++        ]
++        res = client.put("/bulk", json=payload)
++        assert res.status_code == 200
++        body = res.json()
++        assert body["total"] == 2
++        assert body["succeeded"] == 2
++        assert body["failed"] == 0
++        for r in body["results"]:
++            assert r["status_code"] == 200
++            assert r["data"] is not None
++            assert isinstance(r["data"], dict)
++            assert "title" in r["data"]
++            assert r["errors"] is None
++        events[0].refresh_from_db()
++        events[1].refresh_from_db()
++        assert events[0].title == "Updated0"
++        assert events[1].title == "Updated1"
++
++    def test_bulk_update_atomic_rolls_back_on_not_found(self):
++        events = self._create_events(1)
++        client = TestClient(EventBulkAtomicController)
++        payload = [
++            {"id": events[0].id, "title": "ShouldRollback", "start_date": "2025-03-01", "end_date": "2025-03-02"},
++            {"id": 999999, "title": "NotExist", "start_date": "2025-04-01", "end_date": "2025-04-02"},
++        ]
++        res = client.put("/bulk", json=payload)
++        assert res.status_code == 200
++        body = res.json()
++        assert body["succeeded"] == 0
++        assert body["failed"] == 2
++        events[0].refresh_from_db()
++        assert events[0].title != "ShouldRollback"
++
++    def test_bulk_update_non_atomic_partial_failure(self):
++        events = self._create_events(2)
++        client = TestClient(EventBulkNonAtomicController)
++        payload = [
++            {"id": events[0].id, "title": "PartialUpd", "start_date": "2025-05-01", "end_date": "2025-05-02"},
++            {"id": 999999, "title": "Ghost", "start_date": "2025-06-01", "end_date": "2025-06-02"},
++        ]
++        res = client.put("/bulk", json=payload)
++        assert res.status_code == 200
++        body = res.json()
++        assert body["succeeded"] == 1
++        assert body["failed"] == 1
++        assert body["results"][0]["success"] is True
++        assert body["results"][0]["status_code"] == 200
++        assert body["results"][1]["success"] is False
++        assert body["results"][1]["status_code"] == 404
++        events[0].refresh_from_db()
++        assert events[0].title == "PartialUpd"
++
++    def test_bulk_update_max_items_enforced(self):
++        events = self._create_events(5)
++        client = TestClient(EventBulkAtomicController)
++        payload = [
++            {"id": e.id, "title": f"UpdMax{i}", "start_date": "2025-01-01", "end_date": "2025-01-02"}
++            for i, e in enumerate(events)
++        ]
++        # max_items=5, so 5 items should succeed
++        res = client.put("/bulk", json=payload)
++        assert res.status_code == 200
++        # Now try 6 items (exceeds max_items=5)
++        extra = Event.objects.create(title="Extra", start_date="2024-01-01", end_date="2024-01-02")
++        payload.append({"id": extra.id, "title": "UpdMax5", "start_date": "2025-01-01", "end_date": "2025-01-02"})
++        res = client.put("/bulk", json=payload)
++        assert res.status_code == 400
++
++
++@pytest.mark.django_db
++class TestBulkPatch:
++    """Bulk patch operations (partial update semantics)."""
++
++    def test_bulk_patch_partial_fields(self):
++        e1 = Event.objects.create(title="PatchMe1", start_date="2024-01-01", end_date="2024-01-02")
++        e2 = Event.objects.create(title="PatchMe2", start_date="2024-02-01", end_date="2024-02-02")
++        client = TestClient(EventBulkAtomicController)
++        payload = [
++            {"id": e1.id, "title": "Patched1"},
++            {"id": e2.id, "title": "Patched2"},
++        ]
++        res = client.patch("/bulk", json=payload)
++        assert res.status_code == 200
++        body = res.json()
++        assert body["succeeded"] == 2
++        for r in body["results"]:
++            assert r["status_code"] == 200
++            assert r["data"] is not None
++            assert isinstance(r["data"], dict)
++            assert "title" in r["data"]
++            assert r["errors"] is None
++        e1.refresh_from_db()
++        e2.refresh_from_db()
++        assert e1.title == "Patched1"
++        assert e2.title == "Patched2"
++
++    def test_bulk_patch_non_atomic_partial_failure(self):
++        e1 = Event.objects.create(title="PatchOK", start_date="2024-03-01", end_date="2024-03-02")
++        client = TestClient(EventBulkNonAtomicController)
++        payload = [
++            {"id": e1.id, "title": "PatchedOK"},
++            {"id": 999999, "title": "PatchGhost"},
++        ]
++        res = client.patch("/bulk", json=payload)
++        assert res.status_code == 200
++        body = res.json()
++        assert body["succeeded"] == 1
++        assert body["failed"] == 1
++        assert body["results"][1]["status_code"] == 404
++        e1.refresh_from_db()
++        assert e1.title == "PatchedOK"
++
++    def test_bulk_patch_max_items_enforced(self):
++        events = [Event.objects.create(title=f"PMax{i}", start_date="2024-01-01", end_date="2024-01-02") for i in range(6)]
++        client = TestClient(EventBulkAtomicController)
++        payload = [{"id": e.id, "title": f"PMaxUpd{i}"} for i, e in enumerate(events)]
++        res = client.patch("/bulk", json=payload)
++        assert res.status_code == 400
++
++
++@pytest.mark.django_db
++class TestBulkDelete:
++    """Bulk delete operations."""
++
++    def test_bulk_delete_success(self):
++        e1 = Event.objects.create(title="Del1", start_date="2024-01-01", end_date="2024-01-02")
++        e2 = Event.objects.create(title="Del2", start_date="2024-02-01", end_date="2024-02-02")
++        client = TestClient(EventBulkAtomicController)
++        res = client.post("/bulk/delete", json={"ids": [e1.id, e2.id]})
++        assert res.status_code == 200
++        body = res.json()
++        assert body["total"] == 2
++        assert body["succeeded"] == 2
++        assert body["failed"] == 0
++        assert not Event.objects.filter(id=e1.id).exists()
++        assert not Event.objects.filter(id=e2.id).exists()
++
++    def test_bulk_delete_atomic_rolls_back_on_not_found(self):
++        e1 = Event.objects.create(title="DelRollback", start_date="2024-03-01", end_date="2024-03-02")
++        client = TestClient(EventBulkAtomicController)
++        res = client.post("/bulk/delete", json={"ids": [e1.id, 999999]})
++        assert res.status_code == 200
++        body = res.json()
++        assert body["succeeded"] == 0
++        assert body["failed"] == 2
++        assert Event.objects.filter(id=e1.id).exists()
++
++    def test_bulk_delete_non_atomic_partial_failure(self):
++        e1 = Event.objects.create(title="DelPartial", start_date="2024-04-01", end_date="2024-04-02")
++        client = TestClient(EventBulkNonAtomicController)
++        res = client.post("/bulk/delete", json={"ids": [e1.id, 999999]})
++        assert res.status_code == 200
++        body = res.json()
++        assert body["succeeded"] == 1
++        assert body["failed"] == 1
++        assert body["results"][0]["success"] is True
++        assert body["results"][0]["status_code"] == 204
++        assert body["results"][1]["success"] is False
++        assert body["results"][1]["status_code"] == 404
++        assert not Event.objects.filter(id=e1.id).exists()
++
++    def test_bulk_delete_empty_ids(self):
++        client = TestClient(EventBulkAtomicController)
++        res = client.post("/bulk/delete", json={"ids": []})
++        assert res.status_code == 200
++        body = res.json()
++        assert body["total"] == 0
++        assert body["succeeded"] == 0
++
++    def test_bulk_delete_max_items_enforced(self):
++        events = [Event.objects.create(title=f"DelMax{i}", start_date="2024-01-01", end_date="2024-01-02") for i in range(6)]
++        client = TestClient(EventBulkAtomicController)
++        res = client.post("/bulk/delete", json={"ids": [e.id for e in events]})
++        assert res.status_code == 400
++
++    def test_bulk_delete_with_custom_lookup_param(self):
++        """Verify that lookup_param='id' in the factory actually works for delete."""
++        e1 = Event.objects.create(title="LookupDel1", start_date="2024-01-01", end_date="2024-01-02")
++        e2 = Event.objects.create(title="LookupDel2", start_date="2024-02-01", end_date="2024-02-02")
++        client = TestClient(EventBulkCustomController)
++        res = client.post("/bulk/delete", json={"ids": [e1.id, e2.id]})
++        assert res.status_code == 200
++        body = res.json()
++        assert body["succeeded"] == 2
++        assert body["failed"] == 0
++        assert not Event.objects.filter(id=e1.id).exists()
++        assert not Event.objects.filter(id=e2.id).exists()
++
++
++@pytest.mark.django_db(transaction=True)
++class TestBulkAsync:
++    """Async bulk operations."""
++
++    @pytest.mark.asyncio
++    async def test_async_bulk_create(self):
++        client = TestAsyncClient(EventBulkAsyncController)
++        items = [
++            {"title": "Async1", "start_date": "2024-01-01", "end_date": "2024-01-02"},
++            {"title": "Async2", "start_date": "2024-02-01", "end_date": "2024-02-02"},
++        ]
++        res = await client.post("/bulk", json=items)
++        assert res.status_code == 200
++        body = res.json()
++        assert body["total"] == 2
++        assert body["succeeded"] == 2
++        assert body["failed"] == 0
++
++    @pytest.mark.asyncio
++    async def test_async_bulk_update(self):
++        from asgiref.sync import sync_to_async
++        e1 = await sync_to_async(Event.objects.create)(
++            title="AsyncUpd1", start_date="2024-01-01", end_date="2024-01-02"
++        )
++        client = TestAsyncClient(EventBulkAsyncController)
++        payload = [{"id": e1.id, "title": "AsyncUpdated1", "start_date": "2025-01-01", "end_date": "2025-01-02"}]
++        res = await client.put("/bulk", json=payload)
++        assert res.status_code == 200
++        body = res.json()
++        assert body["total"] == 1
++        assert body["succeeded"] == 1
++        assert body["failed"] == 0
++        assert body["results"][0]["status_code"] == 200
++        updated = await sync_to_async(Event.objects.get)(id=e1.id)
++        assert updated.title == "AsyncUpdated1"
++
++    @pytest.mark.asyncio
++    async def test_async_bulk_patch(self):
++        from asgiref.sync import sync_to_async
++        e1 = await sync_to_async(Event.objects.create)(
++            title="AsyncPatch1", start_date="2024-01-01", end_date="2024-01-02"
++        )
++        client = TestAsyncClient(EventBulkAsyncController)
++        payload = [{"id": e1.id, "title": "AsyncPatched1"}]
++        res = await client.patch("/bulk", json=payload)
++        assert res.status_code == 200
++        body = res.json()
++        assert body["total"] == 1
++        assert body["succeeded"] == 1
++        assert body["failed"] == 0
++        assert body["results"][0]["status_code"] == 200
++        patched = await sync_to_async(Event.objects.get)(id=e1.id)
++        assert patched.title == "AsyncPatched1"
++
++    @pytest.mark.asyncio
++    async def test_async_bulk_delete(self):
++        from asgiref.sync import sync_to_async
++        e1 = await sync_to_async(Event.objects.create)(
++            title="AsyncDel1", start_date="2024-01-01", end_date="2024-01-02"
++        )
++        client = TestAsyncClient(EventBulkAsyncController)
++        res = await client.post("/bulk/delete", json={"ids": [e1.id]})
++        assert res.status_code == 200
++        body = res.json()
++        assert body["succeeded"] == 1
++        exists = await sync_to_async(Event.objects.filter(id=e1.id).exists)()
++        assert not exists
++
++
++@pytest.mark.django_db
++class TestBulkCustomEndpoints:
++    """Custom bulk endpoints via ModelEndpointFactory direct usage."""
++
++    def test_custom_bulk_create(self):
++        client = TestClient(EventBulkCustomController)
++        items = [
++            {"title": "Custom1", "start_date": "2024-01-01", "end_date": "2024-01-02"},
++            {"title": "Custom2", "start_date": "2024-02-01", "end_date": "2024-02-02"},
++        ]
++        res = client.post("/bulk", json=items)
++        assert res.status_code == 200
++        body = res.json()
++        assert body["succeeded"] == 2
++        assert Event.objects.filter(title="Custom1").exists()
++        assert Event.objects.filter(title="Custom2").exists()
++
++    def test_custom_bulk_create_max_items(self):
++        client = TestClient(EventBulkCustomController)
++        items = [
++            {"title": f"Over{i}", "start_date": "2024-01-01", "end_date": "2024-01-02"}
++            for i in range(4)
++        ]
++        res = client.post("/bulk", json=items)
++        assert res.status_code == 400
++
++
++@pytest.mark.django_db
++class TestBulkFactoryUpdatePatch:
++    """Factory-registered bulk update and patch endpoints."""
++
++    def test_factory_bulk_update(self):
++        e1 = Event.objects.create(title="FacUpd1", start_date="2024-01-01", end_date="2024-01-02")
++        client = TestClient(EventBulkFactoryUpdatePatchController)
++        payload = [{"id": e1.id, "title": "FacUpdated1", "start_date": "2025-01-01", "end_date": "2025-01-02"}]
++        res = client.put("/bulk", json=payload)
++        assert res.status_code == 200
++        body = res.json()
++        assert body["succeeded"] == 1
++        assert body["results"][0]["status_code"] == 200
++        e1.refresh_from_db()
++        assert e1.title == "FacUpdated1"
++
++    def test_factory_bulk_patch(self):
++        e1 = Event.objects.create(title="FacPatch1", start_date="2024-01-01", end_date="2024-01-02")
++        client = TestClient(EventBulkFactoryUpdatePatchController)
++        payload = [{"id": e1.id, "title": "FacPatched1"}]
++        res = client.patch("/bulk", json=payload)
++        assert res.status_code == 200
++        body = res.json()
++        assert body["succeeded"] == 1
++        assert body["results"][0]["status_code"] == 200
++        e1.refresh_from_db()
++        assert e1.title == "FacPatched1"
++
++
++@pytest.mark.django_db
++class TestBulkAllowedRoutes:
++    """Validate that bulk routes are recognized in allowed_routes."""
++
++    def test_bulk_routes_in_allowed_routes(self):
++        config = ModelConfig(
++            model=Event,
++            allowed_routes=["bulk_create", "bulk_update", "bulk_patch", "bulk_delete"],
++            create_schema=CreateEventSchema,
++            retrieve_schema=EventSchema,
++            update_schema=CreateEventSchema,
++            patch_schema=CreateEventSchema,
++        )
++        assert "bulk_create" in config.allowed_routes
++        assert "bulk_update" in config.allowed_routes
++        assert "bulk_patch" in config.allowed_routes
++        assert "bulk_delete" in config.allowed_routes
++
++    def test_invalid_bulk_route_raises(self):
++        with pytest.raises(Exception):
++            ModelConfig(
++                model=Event,
++                allowed_routes=["bulk_invalid"],
++                create_schema=CreateEventSchema,
++                retrieve_schema=EventSchema,
++            )
++
++
++@pytest.mark.django_db
++class TestBulkResponseStructure:
++    """Verify the exact response structure for bulk operations."""
++
++    def test_create_success_result_has_data_and_no_errors(self):
++        client = TestClient(EventBulkNonAtomicController)
++        items = [
++            {"title": "DataCheck", "start_date": "2024-01-01", "end_date": "2024-01-02"},
++        ]
++        res = client.post("/bulk", json=items)
++        assert res.status_code == 200
++        body = res.json()
++        result_item = body["results"][0]
++        assert result_item["success"] is True
++        assert result_item["data"] is not None
++        assert isinstance(result_item["data"], dict)
++        assert "title" in result_item["data"]
++        assert result_item["data"]["title"] == "DataCheck"
++        assert result_item["errors"] is None
++
++    def test_update_failure_result_has_errors_and_no_data(self):
++        client = TestClient(EventBulkNonAtomicController)
++        payload = [
++            {"id": 999999, "title": "Ghost", "start_date": "2025-01-01", "end_date": "2025-01-02"},
++        ]
++        res = client.put("/bulk", json=payload)
++        assert res.status_code == 200
++        body = res.json()
++        result_item = body["results"][0]
++        assert result_item["success"] is False
++        assert result_item["status_code"] == 404
++        assert result_item["data"] is None
++        assert result_item["errors"] is not None
++        assert isinstance(result_item["errors"], str)
++
++    def test_delete_success_result_has_no_data(self):
++        e1 = Event.objects.create(title="DelData", start_date="2024-01-01", end_date="2024-01-02")
++        client = TestClient(EventBulkNonAtomicController)
++        res = client.post("/bulk/delete", json={"ids": [e1.id]})
++        assert res.status_code == 200
++        body = res.json()
++        result_item = body["results"][0]
++        assert result_item["success"] is True
++        assert result_item["status_code"] == 204
++        assert result_item["data"] is None
++        assert result_item["errors"] is None
++
++    def test_delete_failure_result_has_errors(self):
++        client = TestClient(EventBulkNonAtomicController)
++        res = client.post("/bulk/delete", json={"ids": [999999]})
++        assert res.status_code == 200
++        body = res.json()
++        result_item = body["results"][0]
++        assert result_item["success"] is False
++        assert result_item["status_code"] == 404
++        assert result_item["data"] is None
++        assert result_item["errors"] is not None
++        assert isinstance(result_item["errors"], str)
++
++    def test_succeeded_plus_failed_equals_total(self):
++        e1 = Event.objects.create(title="Math1", start_date="2024-01-01", end_date="2024-01-02")
++        client = TestClient(EventBulkNonAtomicController)
++        payload = [
++            {"id": e1.id, "title": "MathUpd", "start_date": "2025-01-01", "end_date": "2025-01-02"},
++            {"id": 999999, "title": "MathGhost", "start_date": "2025-02-01", "end_date": "2025-02-02"},
++        ]
++        res = client.put("/bulk", json=payload)
++        assert res.status_code == 200
++        body = res.json()
++        assert body["succeeded"] + body["failed"] == body["total"]
++
++
++@pytest.mark.django_db
++class TestBulkNonDefaultLookupParam:
++    """Verify that lookup_param override works with a non-default field."""
++
++    def test_bulk_delete_with_non_default_lookup_param(self):
++        """Delete events by title instead of the default pk field."""
++        e1 = Event.objects.create(title="UniqueDel1", start_date="2024-01-01", end_date="2024-01-02")
++        e2 = Event.objects.create(title="UniqueDel2", start_date="2024-02-01", end_date="2024-02-02")
++        client = TestClient(EventBulkTitleLookupController)
++        res = client.post("/bulk/delete", json={"ids": ["UniqueDel1", "UniqueDel2"]})
++        assert res.status_code == 200
++        body = res.json()
++        assert body["succeeded"] == 2
++        assert body["failed"] == 0
++        assert not Event.objects.filter(id=e1.id).exists()
++        assert not Event.objects.filter(id=e2.id).exists()
++
++    def test_bulk_delete_non_default_lookup_not_found(self):
++        """Looking up by a title that doesn't exist returns 404 per-item."""
++        client = TestClient(EventBulkTitleLookupController)
++        res = client.post("/bulk/delete", json={"ids": ["NoSuchTitle"]})
++        assert res.status_code == 200
++        body = res.json()
++        assert body["succeeded"] == 0
++        assert body["failed"] == 1
++        assert body["results"][0]["status_code"] == 404
++
++
++@pytest.mark.django_db
++class TestBulkFactoryOverridesIndependentOfConfig:
++    """Factory per-endpoint settings override BulkOperationConfig on the same controller."""
++
++    def test_factory_max_items_overrides_config(self):
++        """Config max_items=50 but factory max_items=2; sending 3 items must fail."""
++        client = TestClient(EventBulkOverrideController)
++        items = [
++            {"title": f"Over{i}", "start_date": "2024-01-01", "end_date": "2024-01-02"}
++            for i in range(3)
++        ]
++        res = client.post("/bulk", json=items)
++        assert res.status_code == 400
++
++    def test_factory_max_items_within_factory_limit_succeeds(self):
++        """Sending 2 items succeeds (within factory's max_items=2, ignoring config's 50)."""
++        client = TestClient(EventBulkOverrideController)
++        items = [
++            {"title": f"OK{i}", "start_date": "2024-01-01", "end_date": "2024-01-02"}
++            for i in range(2)
++        ]
++        res = client.post("/bulk", json=items)
++        assert res.status_code == 200
++        assert res.json()["succeeded"] == 2
++
++    def test_factory_atomic_false_overrides_config_atomic_true(self):
++        """Config atomic=True but factory atomic=False; partial failure deletes the valid item."""
++        e1 = Event.objects.create(title="AtomOverride1", start_date="2024-01-01", end_date="2024-01-02")
++        client = TestClient(EventBulkOverrideController)
++        res = client.post("/bulk/delete", json={"ids": [e1.id, 999999]})
++        assert res.status_code == 200
++        body = res.json()
++        # Non-atomic: valid item deleted, invalid item fails independently
++        assert body["succeeded"] == 1
++        assert body["failed"] == 1
++        assert not Event.objects.filter(id=e1.id).exists()
++
++
++@pytest.mark.django_db
++class TestBulkAutoRegistrationDefaults:
++    """Auto-registered bulk routes without bulk_config use fallback defaults."""
++
++    def test_default_max_items_allows_100(self):
++        """With no bulk_config, default max_items=100; sending 100 items should succeed."""
++        client = TestClient(EventBulkDefaultsController)
++        items = [
++            {"title": f"Def{i}", "start_date": "2024-01-01", "end_date": "2024-01-02"}
++            for i in range(100)
++        ]
++        res = client.post("/bulk", json=items)
++        assert res.status_code == 200
++        assert res.json()["succeeded"] == 100
++
++    def test_default_max_items_rejects_101(self):
++        """With no bulk_config, default max_items=100; sending 101 items should fail."""
++        client = TestClient(EventBulkDefaultsController)
++        items = [
++            {"title": f"Over{i}", "start_date": "2024-01-01", "end_date": "2024-01-02"}
++            for i in range(101)
++        ]
++        res = client.post("/bulk", json=items)
++        assert res.status_code == 400
++
++    def test_default_atomic_rolls_back_on_failure(self):
++        """With no bulk_config, default atomic=True; a not-found rolls back all."""
++        e1 = Event.objects.create(title="DefAtom1", start_date="2024-01-01", end_date="2024-01-02")
++        client = TestClient(EventBulkDefaultsController)
++        payload = [
++            {"id": e1.id, "title": "DefUpd", "start_date": "2025-01-01", "end_date": "2025-01-02"},
++            {"id": 999999, "title": "Ghost", "start_date": "2025-01-01", "end_date": "2025-01-02"},
++        ]
++        res = client.put("/bulk", json=payload)
++        assert res.status_code == 200
++        body = res.json()
++        assert body["succeeded"] == 0
++        assert body["failed"] == 2
++        e1.refresh_from_db()
++        assert e1.title == "DefAtom1"  # rolled back
++
++
++@pytest.mark.django_db
++class TestBulkNonDefaultLookupUpdatePatch:
++    """Non-default lookup_param for bulk update and patch operations."""
++
++    def test_bulk_update_by_title(self):
++        """Update events looked up by title instead of pk."""
++        e1 = Event.objects.create(title="TitleUpd1", start_date="2024-01-01", end_date="2024-01-02")
++        client = TestClient(EventBulkTitleLookupController)
++        payload = [{"title": "TitleUpd1", "start_date": "2025-06-01", "end_date": "2025-06-02"}]
++        res = client.put("/bulk", json=payload)
++        assert res.status_code == 200
++        body = res.json()
++        assert body["succeeded"] == 1
++        assert body["results"][0]["status_code"] == 200
++        e1.refresh_from_db()
++        assert str(e1.start_date) == "2025-06-01"
++
++    def test_bulk_update_by_title_not_found(self):
++        client = TestClient(EventBulkTitleLookupController)
++        payload = [{"title": "NoSuchEvent", "start_date": "2025-06-01", "end_date": "2025-06-02"}]
++        res = client.put("/bulk", json=payload)
++        assert res.status_code == 200
++        body = res.json()
++        assert body["succeeded"] == 0
++        assert body["failed"] == 1
++        assert body["results"][0]["success"] is False
++        assert body["results"][0]["status_code"] == 404
++
++    def test_bulk_patch_by_title(self):
++        """Patch events looked up by title instead of pk."""
++        e1 = Event.objects.create(title="TitlePatch1", start_date="2024-01-01", end_date="2024-01-02")
++        client = TestClient(EventBulkTitleLookupController)
++        payload = [{"title": "TitlePatch1", "end_date": "2025-12-31"}]
++        res = client.patch("/bulk", json=payload)
++        assert res.status_code == 200
++        body = res.json()
++        assert body["succeeded"] == 1
++        assert body["results"][0]["status_code"] == 200
++        e1.refresh_from_db()
++        assert str(e1.end_date) == "2025-12-31"
++        assert str(e1.start_date) == "2024-01-01"  # unchanged
++
++    def test_bulk_patch_by_title_not_found(self):
++        client = TestClient(EventBulkTitleLookupController)
++        payload = [{"title": "NoSuchPatch", "end_date": "2025-12-31"}]
++        res = client.patch("/bulk", json=payload)
++        assert res.status_code == 200
++        body = res.json()
++        assert body["succeeded"] == 0
++        assert body["failed"] == 1
++        assert body["results"][0]["success"] is False
++        assert body["results"][0]["status_code"] == 404
++
++
++class TestBulkRouteInfoDefaults:
++    """ModelConfig bulk_*_route_info dicts default to empty dict."""
++
++    def test_bulk_route_info_defaults(self):
++        config = ModelConfig(
++            model=Event,
++            allowed_routes=[],
++            create_schema=CreateEventSchema,
++            retrieve_schema=EventSchema,
++        )
++        assert config.bulk_create_route_info == {}
++        assert config.bulk_update_route_info == {}
++        assert config.bulk_patch_route_info == {}
++        assert config.bulk_delete_route_info == {}
++
++
++class TestBulkOperationConfigValidation:
++    """BulkOperationConfig field validation."""
++
++    def test_max_items_zero_rejected(self):
++        """max_items has ge=1; zero must be rejected."""
++        with pytest.raises(Exception):
++            BulkOperationConfig(max_items=0)
++
++    def test_max_items_negative_rejected(self):
++        with pytest.raises(Exception):
++            BulkOperationConfig(max_items=-1)
++
++
++# ── Permission class for behavioral tests ───────────────────
++from ninja_extra.permissions import BasePermission
++
++
++class DenyTitleStartingWithBlocked(BasePermission):
++    """Denies access to any object whose title starts with 'Blocked'."""
++
++    def has_permission(self, request, controller):
++        return True
++
++    def has_object_permission(self, request, controller, obj):
++        return not getattr(obj, "title", "").startswith("Blocked")
++
++
++# ── Controller with object-level permission on bulk routes ──
++@api_controller("/events-bulk-perms")
++class EventBulkPermissionController(ModelControllerBase):
++    model_config = ModelConfig(
++        model=Event,
++        allowed_routes=[],
++        create_schema=CreateEventSchema,
++        retrieve_schema=EventSchema,
++        update_schema=CreateEventSchema,
++        patch_schema=PatchEventSchema,
++        pagination=None,
++    )
++
++    bulk_update_events = ModelEndpointFactory.bulk_update(
++        path="/bulk",
++        lookup_param="id",
++        schema_in=CreateEventSchema,
++        pk_type=int,
++        atomic=False,
++        max_items=10,
++        permissions=[DenyTitleStartingWithBlocked],
++    )
++
++    bulk_patch_events = ModelEndpointFactory.bulk_patch(
++        path="/bulk",
++        lookup_param="id",
++        schema_in=PatchEventSchema,
++        pk_type=int,
++        atomic=False,
++        max_items=10,
++        permissions=[DenyTitleStartingWithBlocked],
++    )
++
++    bulk_delete_events = ModelEndpointFactory.bulk_delete(
++        path="/bulk/delete",
++        pk_type=int,
++        lookup_param="id",
++        atomic=False,
++        max_items=10,
++        permissions=[DenyTitleStartingWithBlocked],
++    )
++
++
++@pytest.mark.django_db
++class TestBulkPerObjectPermissions:
++    """Bulk operations must enforce per-object permissions, matching single-item behavior."""
++
++    def test_bulk_update_denied_object_fails_permitted_succeeds(self):
++        allowed = Event.objects.create(title="Allowed1", start_date="2024-01-01", end_date="2024-01-02")
++        blocked = Event.objects.create(title="BlockedObj", start_date="2024-01-01", end_date="2024-01-02")
++        client = TestClient(EventBulkPermissionController)
++        payload = [
++            {"id": allowed.id, "title": "Updated", "start_date": "2025-01-01", "end_date": "2025-01-02"},
++            {"id": blocked.id, "title": "Nope", "start_date": "2025-01-01", "end_date": "2025-01-02"},
++        ]
++        res = client.put("/bulk", json=payload)
++        assert res.status_code == 200
++        body = res.json()
++        assert body["succeeded"] == 1
++        assert body["failed"] == 1
++        assert body["results"][0]["success"] is True
++        assert body["results"][0]["status_code"] == 200
++        assert body["results"][1]["success"] is False
++        assert body["results"][1]["status_code"] == 403
++        allowed.refresh_from_db()
++        assert allowed.title == "Updated"
++        blocked.refresh_from_db()
++        assert blocked.title == "BlockedObj"  # unchanged
++
++    def test_bulk_patch_denied_object_fails_permitted_succeeds(self):
++        allowed = Event.objects.create(title="Allowed2", start_date="2024-01-01", end_date="2024-01-02")
++        blocked = Event.objects.create(title="BlockedPatch", start_date="2024-01-01", end_date="2024-01-02")
++        client = TestClient(EventBulkPermissionController)
++        payload = [
++            {"id": allowed.id, "title": "Patched"},
++            {"id": blocked.id, "title": "Nope"},
++        ]
++        res = client.patch("/bulk", json=payload)
++        assert res.status_code == 200
++        body = res.json()
++        assert body["succeeded"] == 1
++        assert body["failed"] == 1
++        assert body["results"][0]["success"] is True
++        assert body["results"][0]["status_code"] == 200
++        assert body["results"][1]["success"] is False
++        assert body["results"][1]["status_code"] == 403
++        allowed.refresh_from_db()
++        assert allowed.title == "Patched"
++        blocked.refresh_from_db()
++        assert blocked.title == "BlockedPatch"  # unchanged
++
++    def test_bulk_delete_denied_object_fails_permitted_succeeds(self):
++        allowed = Event.objects.create(title="AllowedDel", start_date="2024-01-01", end_date="2024-01-02")
++        blocked = Event.objects.create(title="BlockedDel", start_date="2024-01-01", end_date="2024-01-02")
++        client = TestClient(EventBulkPermissionController)
++        res = client.post("/bulk/delete", json={"ids": [allowed.id, blocked.id]})
++        assert res.status_code == 200
++        body = res.json()
++        assert body["succeeded"] == 1
++        assert body["failed"] == 1
++        assert body["results"][0]["success"] is True
++        assert body["results"][0]["status_code"] == 204
++        assert body["results"][1]["success"] is False
++        assert body["results"][1]["status_code"] == 403
++        assert not Event.objects.filter(id=allowed.id).exists()
++        assert Event.objects.filter(id=blocked.id).exists()  # not deleted
++
++    def test_bulk_update_not_found_vs_permission_denied_status_codes(self):
++        """Not-found items get 404, permission-denied items get 403."""
++        blocked = Event.objects.create(title="BlockedMixed", start_date="2024-01-01", end_date="2024-01-02")
++        client = TestClient(EventBulkPermissionController)
++        payload = [
++            {"id": 999999, "title": "Ghost", "start_date": "2025-01-01", "end_date": "2025-01-02"},
++            {"id": blocked.id, "title": "Nope", "start_date": "2025-01-01", "end_date": "2025-01-02"},
++        ]
++        res = client.put("/bulk", json=payload)
++        assert res.status_code == 200
++        body = res.json()
++        assert body["succeeded"] == 0
++        assert body["failed"] == 2
++        assert body["results"][0]["status_code"] == 404
++        assert body["results"][1]["status_code"] == 403
++
++
++@pytest.mark.django_db
++class TestBulkNonAtomicUnexpectedError:
++    """Non-atomic mode falls back to status_code 500 for non-APIException errors."""
++
++    def test_unexpected_error_returns_500_status_code(self, monkeypatch):
++        """A RuntimeError during update yields status_code 500, not 404."""
++        from ninja_extra.controllers.model.service import ModelService
++
++        e1 = Event.objects.create(title="Err500", start_date="2024-01-01", end_date="2024-01-02")
++        client = TestClient(EventBulkNonAtomicController)
++
++        original_update = ModelService.update
++
++        def exploding_update(self, instance, schema, **kwargs):
++            raise RuntimeError("unexpected DB failure")
++
++        monkeypatch.setattr(ModelService, "update", exploding_update)
++
++        payload = [
++            {"id": e1.id, "title": "Boom", "start_date": "2025-01-01", "end_date": "2025-01-02"},
++        ]
++        res = client.put("/bulk", json=payload)
++        assert res.status_code == 200
++        body = res.json()
++        assert body["failed"] == 1
++        assert body["results"][0]["success"] is False
++        assert body["results"][0]["status_code"] == 500
++        assert body["results"][0]["errors"] is not None
++
++
++@pytest.mark.django_db
++class TestBulkAtomicResponseShape:
++    """Atomic failures must produce results covering every input item with correct status codes and labels."""
++
++    def test_atomic_update_failure_results_cover_all_items(self):
++        """3 items: index 0 succeeds before rollback, index 1 fails (not found), index 2 skipped."""
++        e0 = Event.objects.create(title="AtShape0", start_date="2024-01-01", end_date="2024-01-02")
++        client = TestClient(EventBulkAtomicController)
++        payload = [
++            {"id": e0.id, "title": "Upd0", "start_date": "2025-01-01", "end_date": "2025-01-02"},
++            {"id": 999999, "title": "Ghost", "start_date": "2025-01-01", "end_date": "2025-01-02"},
++            {"id": e0.id, "title": "Upd2", "start_date": "2025-01-01", "end_date": "2025-01-02"},
++        ]
++        res = client.put("/bulk", json=payload)
++        assert res.status_code == 200
++        body = res.json()
++        assert body["total"] == 3
++        assert body["succeeded"] == 0
++        assert body["failed"] == 3
++        assert len(body["results"]) == 3
++        # All results for update failure should use 404
++        for r in body["results"]:
++            assert r["status_code"] == 404
++        # Index 0 was rolled back
++        assert body["results"][0]["errors"] == "Rolled back"
++        # Index 1 is the failed item
++        assert body["results"][1]["success"] is False
++        # Index 2 was skipped (never processed)
++        assert body["results"][2]["errors"] == "Skipped"
++        # DB unchanged
++        e0.refresh_from_db()
++        assert e0.title == "AtShape0"
++
++    def test_atomic_delete_failure_results_cover_all_items(self):
++        """3 ids: index 0 deleted before rollback, index 1 not found, index 2 skipped."""
++        e0 = Event.objects.create(title="AtDelShape0", start_date="2024-01-01", end_date="2024-01-02")
++        e2 = Event.objects.create(title="AtDelShape2", start_date="2024-01-01", end_date="2024-01-02")
++        client = TestClient(EventBulkAtomicController)
++        res = client.post("/bulk/delete", json={"ids": [e0.id, 999999, e2.id]})
++        assert res.status_code == 200
++        body = res.json()
++        assert body["total"] == 3
++        assert body["succeeded"] == 0
++        assert body["failed"] == 3
++        assert len(body["results"]) == 3
++        for r in body["results"]:
++            assert r["status_code"] == 404
++        assert body["results"][0]["errors"] == "Rolled back"
++        assert body["results"][2]["errors"] == "Skipped"
++        # e0 still exists (rolled back)
++        assert Event.objects.filter(id=e0.id).exists()
++
++    def test_atomic_patch_failure_results_cover_all_items(self):
++        """3 items: index 0 patched before rollback, index 1 not found, index 2 skipped."""
++        e0 = Event.objects.create(title="AtPatchShape0", start_date="2024-01-01", end_date="2024-01-02")
++        client = TestClient(EventBulkAtomicController)
++        payload = [
++            {"id": e0.id, "title": "Patched0"},
++            {"id": 999999, "title": "Ghost"},
++            {"id": e0.id, "title": "Patched2"},
++        ]
++        res = client.patch("/bulk", json=payload)
++        assert res.status_code == 200
++        body = res.json()
++        assert body["total"] == 3
++        assert body["succeeded"] == 0
++        assert body["failed"] == 3
++        assert len(body["results"]) == 3
++        for r in body["results"]:
++            assert r["status_code"] == 404
++        assert body["results"][0]["errors"] == "Rolled back"
++        assert body["results"][2]["errors"] == "Skipped"
++        e0.refresh_from_db()
++        assert e0.title == "AtPatchShape0"  # unchanged
++
++    def test_atomic_create_success_status_codes(self):
++        """Successful atomic create: each result carries status_code 201."""
++        client = TestClient(EventBulkAtomicController)
++        items = [
++            {"title": "AtCreate1", "start_date": "2024-01-01", "end_date": "2024-01-02"},
++            {"title": "AtCreate2", "start_date": "2024-02-01", "end_date": "2024-02-02"},
++        ]
++        res = client.post("/bulk", json=items)
++        assert res.status_code == 200
++        body = res.json()
++        assert body["total"] == 2
++        assert body["succeeded"] == 2
++        for r in body["results"]:
++            assert r["status_code"] == 201
++            assert r["success"] is True
++
++    def test_bulk_update_empty_list(self):
++        """Empty update request returns zero-result response."""
++        client = TestClient(EventBulkAtomicController)
++        res = client.put("/bulk", json=[])
++        assert res.status_code == 200
++        body = res.json()
++        assert body == {"total": 0, "succeeded": 0, "failed": 0, "results": []}
++
++    def test_bulk_patch_empty_list(self):
++        """Empty patch request returns zero-result response."""
++        client = TestClient(EventBulkAtomicController)
++        res = client.patch("/bulk", json=[])
++        assert res.status_code == 200
++        body = res.json()
++        assert body == {"total": 0, "succeeded": 0, "failed": 0, "results": []}
++
++
++class TestBulkSchemaExistence:
++    """Verify that all mandated schema/exception classes exist in the schemas module."""
++
++    def test_bulk_item_result_exists(self):
++        """BulkItemResult is defined in the schemas module."""
++        assert BulkItemResult is not None
++        # It should be usable as a schema with the expected fields
++        item = BulkItemResult(index=0, success=True, status_code=200, data=None, errors=None)
++        assert item.index == 0
++        assert item.success is True
++        assert item.status_code == 200
++
++    def test_bulk_operation_error_exists(self):
++        """BulkOperationError is defined in the schemas module and is an Exception."""
++        assert issubclass(BulkOperationError, Exception)
++        err = BulkOperationError("test error", results=[], failed_index=0)
++        assert str(err) == "test error"
++        assert err.results == []
++        assert err.failed_index == 0
++
++    def test_bulk_operation_response_exists(self):
++        """BulkOperationResponse is defined in the schemas module with expected fields."""
++        assert BulkOperationResponse is not None
++        resp = BulkOperationResponse(total=1, succeeded=1, failed=0, results=[
++            BulkItemResult(index=0, success=True, status_code=200, data=None, errors=None),
++        ])
++        assert resp.total == 1
++        assert resp.succeeded == 1
++        assert resp.failed == 0
++        assert len(resp.results) == 1

@@ -1,0 +1,993 @@
+diff --git a/src/FinalForm.computedFields.test.ts b/src/FinalForm.computedFields.test.ts
+new file mode 100644
+index 0000000..9b4f26c
+--- /dev/null
++++ b/src/FinalForm.computedFields.test.ts
+@@ -0,0 +1,968 @@
++import createForm from "./FinalForm";
++
++const onSubmitMock = jest.fn();
++
++const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
++
++describe("Computed Fields", () => {
++  beforeEach(() => {
++    onSubmitMock.mockReset();
++  });
++
++  // ─── Registration & Basic API ────────────────────────────────────────
++
++  describe("registerComputedField API", () => {
++    it("should expose registerComputedField on the form API", () => {
++      const form = createForm({ onSubmit: onSubmitMock });
++      expect(typeof form.registerComputedField).toBe("function");
++    });
++
++    it("should register a computed field and return an unsubscribe function", () => {
++      const form = createForm({
++        onSubmit: onSubmitMock,
++        initialValues: { first: "John", last: "Doe" },
++      });
++      const unsub = form.registerComputedField("full", {
++        compute: (values) => `${values.first} ${values.last}`,
++        dependsOn: ["first", "last"],
++      });
++      expect(typeof unsub).toBe("function");
++    });
++
++    it("should make the computed field's value available in getState().values", () => {
++      const form = createForm({
++        onSubmit: onSubmitMock,
++        initialValues: { a: 1, b: 2 },
++      });
++      form.registerComputedField("sum", {
++        compute: (values) => (values.a || 0) + (values.b || 0),
++        dependsOn: ["a", "b"],
++      });
++      expect(form.getState().values.sum).toBe(3);
++    });
++
++    it("should list computed fields in getRegisteredFields", () => {
++      const form = createForm({
++        onSubmit: onSubmitMock,
++        initialValues: { x: 10 },
++      });
++      form.registerField("x", () => {}, { value: true });
++      form.registerComputedField("doubled", {
++        compute: (values) => (values.x || 0) * 2,
++        dependsOn: ["x"],
++      });
++      const fields = form.getRegisteredFields();
++      expect(fields).toContain("x");
++      expect(fields).toContain("doubled");
++    });
++
++    it("should remove the computed field when unsubscribe is called", () => {
++      const form = createForm({
++        onSubmit: onSubmitMock,
++        initialValues: { x: 5 },
++      });
++      const unsub = form.registerComputedField("doubled", {
++        compute: (values) => (values.x || 0) * 2,
++        dependsOn: ["x"],
++      });
++      expect(form.getState().values.doubled).toBe(10);
++      unsub();
++      expect(form.getRegisteredFields()).not.toContain("doubled");
++    });
++
++    it("should throw when calling change() on a computed field", () => {
++      const form = createForm({
++        onSubmit: onSubmitMock,
++        initialValues: { x: 1 },
++      });
++      form.registerComputedField("doubled", {
++        compute: (values) => (values.x || 0) * 2,
++        dependsOn: ["x"],
++      });
++      expect(() => form.change("doubled", 999)).toThrow(/computed/);
++    });
++  });
++
++  // ─── Reactivity: Value Synchronization ───────────────────────────────
++
++  describe("value synchronization on dependency changes", () => {
++    it("should recompute when a dependency changes via change()", () => {
++      const form = createForm({
++        onSubmit: onSubmitMock,
++        initialValues: { price: 100, tax: 0.1 },
++      });
++      form.registerField("price", () => {}, { value: true });
++      form.registerField("tax", () => {}, { value: true });
++      form.registerComputedField("total", {
++        compute: (values) => Math.round((values.price || 0) * (1 + (values.tax || 0)) * 100) / 100,
++        dependsOn: ["price", "tax"],
++      });
++      expect(form.getState().values.total).toBe(110);
++
++      form.change("price", 200);
++      expect(form.getState().values.total).toBe(220);
++
++      form.change("tax", 0.2);
++      expect(form.getState().values.total).toBe(240);
++    });
++
++    it("should recompute when initialize() is called", () => {
++      const form = createForm({
++        onSubmit: onSubmitMock,
++        initialValues: { a: 1, b: 2 },
++      });
++      form.registerComputedField("sum", {
++        compute: (values) => (values.a || 0) + (values.b || 0),
++        dependsOn: ["a", "b"],
++      });
++      expect(form.getState().values.sum).toBe(3);
++
++      form.initialize({ a: 10, b: 20 });
++      expect(form.getState().values.sum).toBe(30);
++    });
++
++    it("should recompute when reset() is called", () => {
++      const form = createForm({
++        onSubmit: onSubmitMock,
++        initialValues: { x: 5 },
++      });
++      form.registerField("x", () => {}, { value: true });
++      form.registerComputedField("neg", {
++        compute: (values) => -(values.x || 0),
++        dependsOn: ["x"],
++      });
++      form.change("x", 100);
++      expect(form.getState().values.neg).toBe(-100);
++
++      form.reset();
++      expect(form.getState().values.neg).toBe(-5);
++    });
++
++    it("should recompute when restart() is called", () => {
++      const form = createForm({
++        onSubmit: onSubmitMock,
++        initialValues: { v: 3 },
++      });
++      form.registerField("v", () => {}, { value: true });
++      form.registerComputedField("sq", {
++        compute: (values) => (values.v || 0) * (values.v || 0),
++        dependsOn: ["v"],
++      });
++      form.change("v", 7);
++      expect(form.getState().values.sq).toBe(49);
++
++      form.restart();
++      expect(form.getState().values.sq).toBe(9);
++    });
++
++    it("should recompute when a mutator changes dependency values", () => {
++      const form = createForm({
++        onSubmit: onSubmitMock,
++        initialValues: { count: 0 },
++        mutators: {
++          increment: (args, state, { changeValue }) => {
++            changeValue(state, "count", (v) => (v || 0) + 1);
++          },
++        },
++      });
++      form.registerField("count", () => {}, { value: true });
++      form.registerComputedField("display", {
++        compute: (values) => `Count: ${values.count || 0}`,
++        dependsOn: ["count"],
++      });
++      expect(form.getState().values.display).toBe("Count: 0");
++
++      form.mutators.increment();
++      expect(form.getState().values.display).toBe("Count: 1");
++    });
++
++    it("should NOT recompute when an unrelated field changes", () => {
++      const compute = jest.fn((values) => (values.a || 0) * 2);
++      const form = createForm({
++        onSubmit: onSubmitMock,
++        initialValues: { a: 5, b: 10 },
++      });
++      form.registerField("a", () => {}, { value: true });
++      form.registerField("b", () => {}, { value: true });
++      form.registerComputedField("aDoubled", {
++        compute,
++        dependsOn: ["a"],
++      });
++
++      const callCountAfterReg = compute.mock.calls.length;
++      form.change("b", 999);
++      // compute should not have been called again
++      expect(compute.mock.calls.length).toBe(callCountAfterReg);
++    });
++  });
++
++  // ─── Memoization ─────────────────────────────────────────────────────
++
++  describe("memoization", () => {
++    it("should not re-invoke compute if dependency values are referentially identical", () => {
++      const compute = jest.fn((values) => (values.x || 0) + 1);
++      const form = createForm({
++        onSubmit: onSubmitMock,
++        initialValues: { x: 10, y: 20 },
++      });
++      form.registerField("x", () => {}, { value: true });
++      form.registerField("y", () => {}, { value: true });
++      form.registerComputedField("xPlus1", {
++        compute,
++        dependsOn: ["x"],
++      });
++
++      const count1 = compute.mock.calls.length;
++      // Change a non-dependency field
++      form.change("y", 30);
++      expect(compute.mock.calls.length).toBe(count1);
++
++      // Change x triggers recompute
++      form.change("x", 10); // same value
++      // Should NOT recompute since the value is referentially identical
++      expect(compute.mock.calls.length).toBe(count1);
++    });
++
++    it("should re-invoke compute when at least one dependency value changes reference", () => {
++      const compute = jest.fn((values) => `${values.first} ${values.last}`);
++      const form = createForm({
++        onSubmit: onSubmitMock,
++        initialValues: { first: "A", last: "B" },
++      });
++      form.registerField("first", () => {}, { value: true });
++      form.registerField("last", () => {}, { value: true });
++      form.registerComputedField("full", {
++        compute,
++        dependsOn: ["first", "last"],
++      });
++
++      const countAfterReg = compute.mock.calls.length;
++      form.change("first", "C");
++      expect(compute.mock.calls.length).toBe(countAfterReg + 1);
++      expect(form.getState().values.full).toBe("C B");
++    });
++  });
++
++  // ─── Subscription System ─────────────────────────────────────────────
++
++  describe("subscription system integration", () => {
++    it("should be subscribable via registerField with value subscription", () => {
++      const form = createForm({
++        onSubmit: onSubmitMock,
++        initialValues: { a: 1, b: 2 },
++      });
++      form.registerComputedField("sum", {
++        compute: (values) => (values.a || 0) + (values.b || 0),
++        dependsOn: ["a", "b"],
++      });
++
++      const subscriber = jest.fn();
++      form.registerField("sum", subscriber, { value: true });
++
++      // subscriber should have been called with initial computed value
++      expect(subscriber).toHaveBeenCalled();
++      const lastCall = subscriber.mock.calls[subscriber.mock.calls.length - 1][0];
++      expect(lastCall.value).toBe(3);
++    });
++
++    it("should notify field subscribers when computed value changes", () => {
++      const form = createForm({
++        onSubmit: onSubmitMock,
++        initialValues: { a: 1, b: 2 },
++      });
++      form.registerField("a", () => {}, { value: true });
++      form.registerField("b", () => {}, { value: true });
++      form.registerComputedField("sum", {
++        compute: (values) => (values.a || 0) + (values.b || 0),
++        dependsOn: ["a", "b"],
++      });
++
++      const subscriber = jest.fn();
++      form.registerField("sum", subscriber, { value: true });
++      subscriber.mockClear();
++
++      form.change("a", 10);
++      expect(subscriber).toHaveBeenCalled();
++      const lastCall = subscriber.mock.calls[subscriber.mock.calls.length - 1][0];
++      expect(lastCall.value).toBe(12);
++    });
++
++    it("should notify form-level subscribers when computed values change", () => {
++      const form = createForm({
++        onSubmit: onSubmitMock,
++        initialValues: { x: 3 },
++      });
++      form.registerField("x", () => {}, { value: true });
++      form.registerComputedField("doubled", {
++        compute: (values) => (values.x || 0) * 2,
++        dependsOn: ["x"],
++      });
++
++      const subscriber = jest.fn();
++      form.subscribe(subscriber, { values: true });
++      subscriber.mockClear();
++
++      form.change("x", 7);
++      expect(subscriber).toHaveBeenCalled();
++      const lastCall = subscriber.mock.calls[subscriber.mock.calls.length - 1][0];
++      expect(lastCall.values.doubled).toBe(14);
++    });
++
++    it("should report dirty/pristine correctly for computed fields", () => {
++      const form = createForm({
++        onSubmit: onSubmitMock,
++        initialValues: { x: 1 },
++      });
++      form.registerField("x", () => {}, { value: true });
++      form.registerComputedField("neg", {
++        compute: (values) => -(values.x || 0),
++        dependsOn: ["x"],
++      });
++
++      const subscriber = jest.fn();
++      form.registerField("neg", subscriber, {
++        dirty: true,
++        pristine: true,
++        value: true,
++      });
++
++      // Initially pristine
++      let lastState = subscriber.mock.calls[subscriber.mock.calls.length - 1][0];
++      expect(lastState.pristine).toBe(true);
++      expect(lastState.dirty).toBe(false);
++
++      // Change dependency: computed value becomes dirty with respect to initial
++      form.change("x", 5);
++      lastState = subscriber.mock.calls[subscriber.mock.calls.length - 1][0];
++      expect(lastState.value).toBe(-5);
++      expect(lastState.dirty).toBe(true);
++    });
++
++    it("should support getFieldState for computed fields", () => {
++      const form = createForm({
++        onSubmit: onSubmitMock,
++        initialValues: { x: 3 },
++      });
++      form.registerComputedField("tripled", {
++        compute: (values) => (values.x || 0) * 3,
++        dependsOn: ["x"],
++      });
++
++      // Must register a subscriber to get field state
++      form.registerField("tripled", () => {}, { value: true });
++      const fieldState = form.getFieldState("tripled");
++      expect(fieldState).toBeDefined();
++      expect(fieldState!.value).toBe(9);
++    });
++  });
++
++  // ─── Validation Integration ──────────────────────────────────────────
++
++  describe("validation integration", () => {
++    it("should participate in record-level validation", () => {
++      const form = createForm({
++        onSubmit: onSubmitMock,
++        initialValues: { a: -1, b: -2 },
++        validate: (values) => {
++          const errors: any = {};
++          if (values.sum !== undefined && values.sum < 0) {
++            errors.sum = "Sum must be non-negative";
++          }
++          return errors;
++        },
++      });
++      form.registerField("a", () => {}, { value: true });
++      form.registerField("b", () => {}, { value: true });
++      form.registerComputedField("sum", {
++        compute: (values) => (values.a || 0) + (values.b || 0),
++        dependsOn: ["a", "b"],
++      });
++
++      const subscriber = jest.fn();
++      form.registerField("sum", subscriber, {
++        error: true,
++        valid: true,
++        value: true,
++      });
++
++      let lastState = subscriber.mock.calls[subscriber.mock.calls.length - 1][0];
++      expect(lastState.value).toBe(-3);
++      expect(lastState.error).toBe("Sum must be non-negative");
++      expect(lastState.valid).toBe(false);
++
++      form.change("a", 5);
++      lastState = subscriber.mock.calls[subscriber.mock.calls.length - 1][0];
++      expect(lastState.value).toBe(3);
++      expect(lastState.error).toBeUndefined();
++      expect(lastState.valid).toBe(true);
++    });
++
++    it("should participate in field-level validation via getValidator", () => {
++      const form = createForm({
++        onSubmit: onSubmitMock,
++        initialValues: { x: -5 },
++      });
++      form.registerField("x", () => {}, { value: true });
++      form.registerComputedField("abs", {
++        compute: (values) => Math.abs(values.x || 0),
++        dependsOn: ["x"],
++      });
++
++      const subscriber = jest.fn();
++      form.registerField("abs", subscriber, { error: true, valid: true, value: true }, {
++        getValidator: () => (value) => {
++          if (value > 100) return "Too large";
++          return undefined;
++        },
++      });
++
++      let lastState = subscriber.mock.calls[subscriber.mock.calls.length - 1][0];
++      expect(lastState.value).toBe(5);
++      expect(lastState.error).toBeUndefined();
++
++      form.change("x", -200);
++      lastState = subscriber.mock.calls[subscriber.mock.calls.length - 1][0];
++      expect(lastState.value).toBe(200);
++      expect(lastState.error).toBe("Too large");
++    });
++
++    it("should affect form-level hasValidationErrors when computed field has errors", () => {
++      const form = createForm({
++        onSubmit: onSubmitMock,
++        initialValues: { n: 0 },
++        validate: (values) => {
++          const errors: any = {};
++          if (values.doubled !== undefined && values.doubled > 10) {
++            errors.doubled = "Too large";
++          }
++          return errors;
++        },
++      });
++      form.registerField("n", () => {}, { value: true });
++      form.registerComputedField("doubled", {
++        compute: (values) => (values.n || 0) * 2,
++        dependsOn: ["n"],
++      });
++
++      expect(form.getState().hasValidationErrors).toBe(false);
++
++      form.change("n", 10);
++      expect(form.getState().values.doubled).toBe(20);
++      expect(form.getState().hasValidationErrors).toBe(true);
++    });
++  });
++
++  // ─── Transitive Dependencies / Topological Sort ──────────────────────
++
++  describe("transitive dependencies and topological ordering", () => {
++    it("should support computed fields depending on other computed fields", () => {
++      const form = createForm({
++        onSubmit: onSubmitMock,
++        initialValues: { base: 10 },
++      });
++      form.registerField("base", () => {}, { value: true });
++      form.registerComputedField("doubled", {
++        compute: (values) => (values.base || 0) * 2,
++        dependsOn: ["base"],
++      });
++      form.registerComputedField("quadrupled", {
++        compute: (values) => (values.doubled || 0) * 2,
++        dependsOn: ["doubled"],
++      });
++
++      expect(form.getState().values.doubled).toBe(20);
++      expect(form.getState().values.quadrupled).toBe(40);
++
++      form.change("base", 5);
++      expect(form.getState().values.doubled).toBe(10);
++      expect(form.getState().values.quadrupled).toBe(20);
++    });
++
++    it("should handle 3-level transitive dependency chains", () => {
++      const form = createForm({
++        onSubmit: onSubmitMock,
++        initialValues: { x: 1 },
++      });
++      form.registerField("x", () => {}, { value: true });
++      form.registerComputedField("a", {
++        compute: (values) => (values.x || 0) + 1,
++        dependsOn: ["x"],
++      });
++      form.registerComputedField("b", {
++        compute: (values) => (values.a || 0) + 1,
++        dependsOn: ["a"],
++      });
++      form.registerComputedField("c", {
++        compute: (values) => (values.b || 0) + 1,
++        dependsOn: ["b"],
++      });
++
++      expect(form.getState().values.a).toBe(2);
++      expect(form.getState().values.b).toBe(3);
++      expect(form.getState().values.c).toBe(4);
++
++      form.change("x", 10);
++      expect(form.getState().values.a).toBe(11);
++      expect(form.getState().values.b).toBe(12);
++      expect(form.getState().values.c).toBe(13);
++    });
++
++    it("should evaluate in correct topological order (dependencies before dependents)", () => {
++      const order: string[] = [];
++      const form = createForm({
++        onSubmit: onSubmitMock,
++        initialValues: { src: 1 },
++      });
++      form.registerField("src", () => {}, { value: true });
++      // Register in reverse dependency order to test that topological sort handles it
++      form.registerComputedField("second", {
++        compute: (values) => {
++          order.push("second");
++          return (values.first || 0) + 1;
++        },
++        dependsOn: ["first"],
++      });
++      form.registerComputedField("first", {
++        compute: (values) => {
++          order.push("first");
++          return (values.src || 0) + 1;
++        },
++        dependsOn: ["src"],
++      });
++
++      order.length = 0;
++      form.change("src", 5);
++
++      // "first" must be evaluated before "second" regardless of registration order
++      const firstIdx = order.indexOf("first");
++      const secondIdx = order.indexOf("second");
++      expect(firstIdx).toBeLessThan(secondIdx);
++      expect(form.getState().values.first).toBe(6);
++      expect(form.getState().values.second).toBe(7);
++    });
++
++    it("should detect circular dependencies and throw at registration time", () => {
++      const form = createForm({
++        onSubmit: onSubmitMock,
++        initialValues: { x: 1 },
++      });
++      form.registerComputedField("a", {
++        compute: (values) => values.b,
++        dependsOn: ["b"],
++      });
++      expect(() => {
++        form.registerComputedField("b", {
++          compute: (values) => values.a,
++          dependsOn: ["a"],
++        });
++      }).toThrow(/circular/i);
++    });
++
++    it("should detect self-referential circular dependency", () => {
++      const form = createForm({
++        onSubmit: onSubmitMock,
++      });
++      expect(() => {
++        form.registerComputedField("self", {
++          compute: (values) => values.self,
++          dependsOn: ["self"],
++        });
++      }).toThrow(/circular/i);
++    });
++
++    it("should detect indirect circular dependencies (A->B->C->A)", () => {
++      const form = createForm({
++        onSubmit: onSubmitMock,
++        initialValues: { x: 1 },
++      });
++      form.registerComputedField("a", {
++        compute: (values) => values.c,
++        dependsOn: ["c"],
++      });
++      form.registerComputedField("b", {
++        compute: (values) => values.a,
++        dependsOn: ["a"],
++      });
++      expect(() => {
++        form.registerComputedField("c", {
++          compute: (values) => values.b,
++          dependsOn: ["b"],
++        });
++      }).toThrow(/circular/i);
++    });
++  });
++
++  // ─── destroyOnUnregister Interaction ─────────────────────────────────
++
++  describe("destroyOnUnregister interaction", () => {
++    it("should receive undefined for unregistered dependency values", () => {
++      const compute = jest.fn((values) => values.dep);
++      const form = createForm({
++        onSubmit: onSubmitMock,
++        initialValues: { dep: 42 },
++        destroyOnUnregister: true,
++      });
++      const unsubDep = form.registerField("dep", () => {}, { value: true });
++      form.registerComputedField("mirror", {
++        compute,
++        dependsOn: ["dep"],
++      });
++
++      expect(form.getState().values.mirror).toBe(42);
++
++      // Unregister the dependency field with destroyOnUnregister
++      unsubDep();
++
++      // After dependency is destroyed, the computed field should recompute
++      // with that dependency being undefined
++      expect(compute).toHaveBeenCalled();
++      const lastCall = compute.mock.calls[compute.mock.calls.length - 1][0];
++      expect(lastCall.dep).toBeUndefined();
++    });
++  });
++
++  // ─── excludeFromSubmit ───────────────────────────────────────────────
++
++  describe("excludeFromSubmit", () => {
++    it("should include computed field in submitted values by default", () => {
++      const form = createForm({
++        onSubmit: onSubmitMock,
++        initialValues: { x: 5 },
++      });
++      form.registerField("x", () => {}, { value: true });
++      form.registerComputedField("doubled", {
++        compute: (values) => (values.x || 0) * 2,
++        dependsOn: ["x"],
++      });
++
++      form.submit();
++      expect(onSubmitMock).toHaveBeenCalledWith(
++        expect.objectContaining({ x: 5, doubled: 10 }),
++        expect.anything(),
++        expect.anything(),
++      );
++    });
++
++    it("should strip excluded computed fields from onSubmit values", () => {
++      const form = createForm({
++        onSubmit: onSubmitMock,
++        initialValues: { x: 5 },
++      });
++      form.registerField("x", () => {}, { value: true });
++      form.registerComputedField("doubled", {
++        compute: (values) => (values.x || 0) * 2,
++        dependsOn: ["x"],
++        excludeFromSubmit: true,
++      });
++
++      // Still visible in getState
++      expect(form.getState().values.doubled).toBe(10);
++
++      form.submit();
++      const submittedValues = onSubmitMock.mock.calls[0][0];
++      expect(submittedValues.doubled).toBeUndefined();
++      expect(submittedValues.x).toBe(5);
++    });
++
++    it("should still show excludeFromSubmit field in subscriber notifications", () => {
++      const form = createForm({
++        onSubmit: onSubmitMock,
++        initialValues: { x: 3 },
++      });
++      form.registerField("x", () => {}, { value: true });
++      form.registerComputedField("tripled", {
++        compute: (values) => (values.x || 0) * 3,
++        dependsOn: ["x"],
++        excludeFromSubmit: true,
++      });
++
++      const sub = jest.fn();
++      form.subscribe(sub, { values: true });
++
++      const lastState = sub.mock.calls[sub.mock.calls.length - 1][0];
++      expect(lastState.values.tripled).toBe(9);
++    });
++  });
++
++  // ─── Batch Coalescing ────────────────────────────────────────────────
++
++  describe("batch coalescing", () => {
++    it("should compute at most once per batch even with multiple dependency changes", () => {
++      const compute = jest.fn(
++        (values) => (values.a || 0) + (values.b || 0) + (values.c || 0),
++      );
++      const form = createForm({
++        onSubmit: onSubmitMock,
++        initialValues: { a: 1, b: 2, c: 3 },
++      });
++      form.registerField("a", () => {}, { value: true });
++      form.registerField("b", () => {}, { value: true });
++      form.registerField("c", () => {}, { value: true });
++      form.registerComputedField("total", {
++        compute,
++        dependsOn: ["a", "b", "c"],
++      });
++
++      const countAfterReg = compute.mock.calls.length;
++      form.batch(() => {
++        form.change("a", 10);
++        form.change("b", 20);
++        form.change("c", 30);
++      });
++
++      // compute should have been called exactly once for the batch
++      expect(compute.mock.calls.length).toBe(countAfterReg + 1);
++      expect(form.getState().values.total).toBe(60);
++    });
++
++    it("should produce correct result after batch with transitive dependencies", () => {
++      const form = createForm({
++        onSubmit: onSubmitMock,
++        initialValues: { x: 1 },
++      });
++      form.registerField("x", () => {}, { value: true });
++      form.registerComputedField("a", {
++        compute: (values) => (values.x || 0) * 2,
++        dependsOn: ["x"],
++      });
++      form.registerComputedField("b", {
++        compute: (values) => (values.a || 0) + 100,
++        dependsOn: ["a"],
++      });
++
++      form.batch(() => {
++        form.change("x", 5);
++      });
++
++      expect(form.getState().values.a).toBe(10);
++      expect(form.getState().values.b).toBe(110);
++    });
++
++    it("should not fire subscriber notifications mid-batch", () => {
++      const form = createForm({
++        onSubmit: onSubmitMock,
++        initialValues: { a: 0, b: 0 },
++      });
++      form.registerField("a", () => {}, { value: true });
++      form.registerField("b", () => {}, { value: true });
++      form.registerComputedField("sum", {
++        compute: (values) => (values.a || 0) + (values.b || 0),
++        dependsOn: ["a", "b"],
++      });
++
++      const sub = jest.fn();
++      form.subscribe(sub, { values: true });
++      sub.mockClear();
++
++      form.batch(() => {
++        form.change("a", 5);
++        form.change("b", 10);
++        // subscriber should NOT have been called mid-batch
++        expect(sub).not.toHaveBeenCalled();
++      });
++
++      // After batch, subscriber should have been called with final values
++      expect(sub).toHaveBeenCalled();
++      const lastCall = sub.mock.calls[sub.mock.calls.length - 1][0];
++      expect(lastCall.values.sum).toBe(15);
++    });
++  });
++
++  // ─── Edge Cases & Traps ──────────────────────────────────────────────
++
++  describe("edge cases", () => {
++    it("should handle computed field registered before its dependency fields exist", () => {
++      const form = createForm({
++        onSubmit: onSubmitMock,
++        initialValues: { x: 7 },
++      });
++      // Register computed field first, before any regular field is registered
++      form.registerComputedField("doubled", {
++        compute: (values) => (values.x || 0) * 2,
++        dependsOn: ["x"],
++      });
++      expect(form.getState().values.doubled).toBe(14);
++
++      // Now register the dependency field and change it
++      form.registerField("x", () => {}, { value: true });
++      form.change("x", 3);
++      expect(form.getState().values.doubled).toBe(6);
++    });
++
++    it("should handle computed field with empty dependsOn array", () => {
++      const form = createForm({
++        onSubmit: onSubmitMock,
++        initialValues: { x: 1 },
++      });
++      form.registerComputedField("constant", {
++        compute: () => 42,
++        dependsOn: [],
++      });
++      expect(form.getState().values.constant).toBe(42);
++    });
++
++    it("should handle computed field whose compute returns undefined", () => {
++      const form = createForm({
++        onSubmit: onSubmitMock,
++        initialValues: { x: undefined },
++      });
++      form.registerComputedField("undef", {
++        compute: (values) => values.x,
++        dependsOn: ["x"],
++      });
++      expect(form.getState().values.undef).toBeUndefined();
++    });
++
++    it("should handle computed field whose compute returns null", () => {
++      const form = createForm({
++        onSubmit: onSubmitMock,
++        initialValues: { x: 1 },
++      });
++      form.registerComputedField("nullField", {
++        compute: () => null,
++        dependsOn: ["x"],
++      });
++      expect(form.getState().values.nullField).toBeNull();
++    });
++
++    it("should handle computed field whose compute returns an object", () => {
++      const form = createForm({
++        onSubmit: onSubmitMock,
++        initialValues: { first: "John", last: "Doe" },
++      });
++      form.registerField("first", () => {}, { value: true });
++      form.registerField("last", () => {}, { value: true });
++      form.registerComputedField("nameObj", {
++        compute: (values) => ({
++          display: `${values.first} ${values.last}`,
++          initials: `${(values.first || "")[0]}${(values.last || "")[0]}`,
++        }),
++        dependsOn: ["first", "last"],
++      });
++
++      expect(form.getState().values.nameObj).toEqual({
++        display: "John Doe",
++        initials: "JD",
++      });
++
++      form.change("first", "Jane");
++      expect(form.getState().values.nameObj).toEqual({
++        display: "Jane Doe",
++        initials: "JD",
++      });
++    });
++
++    it("should clean up computed value from form values on unsubscribe", () => {
++      const form = createForm({
++        onSubmit: onSubmitMock,
++        initialValues: { x: 5 },
++      });
++      const unsub = form.registerComputedField("doubled", {
++        compute: (values) => (values.x || 0) * 2,
++        dependsOn: ["x"],
++      });
++      expect(form.getState().values.doubled).toBe(10);
++
++      unsub();
++      expect(form.getState().values.doubled).toBeUndefined();
++    });
++
++    it("should handle multiple computed fields depending on the same source", () => {
++      const form = createForm({
++        onSubmit: onSubmitMock,
++        initialValues: { x: 4 },
++      });
++      form.registerField("x", () => {}, { value: true });
++      form.registerComputedField("doubled", {
++        compute: (values) => (values.x || 0) * 2,
++        dependsOn: ["x"],
++      });
++      form.registerComputedField("tripled", {
++        compute: (values) => (values.x || 0) * 3,
++        dependsOn: ["x"],
++      });
++      form.registerComputedField("squared", {
++        compute: (values) => (values.x || 0) * (values.x || 0),
++        dependsOn: ["x"],
++      });
++
++      expect(form.getState().values.doubled).toBe(8);
++      expect(form.getState().values.tripled).toBe(12);
++      expect(form.getState().values.squared).toBe(16);
++
++      form.change("x", 3);
++      expect(form.getState().values.doubled).toBe(6);
++      expect(form.getState().values.tripled).toBe(9);
++      expect(form.getState().values.squared).toBe(9);
++    });
++
++    it("should handle unregistering a computed field that others depend on", () => {
++      const form = createForm({
++        onSubmit: onSubmitMock,
++        initialValues: { x: 5 },
++      });
++      form.registerField("x", () => {}, { value: true });
++      const unsubA = form.registerComputedField("a", {
++        compute: (values) => (values.x || 0) * 2,
++        dependsOn: ["x"],
++      });
++      form.registerComputedField("b", {
++        compute: (values) => (values.a || 0) + 1,
++        dependsOn: ["a"],
++      });
++
++      expect(form.getState().values.b).toBe(11);
++
++      // Unregistering 'a' should cause 'b' to see undefined for 'a'
++      unsubA();
++      expect(form.getState().values.a).toBeUndefined();
++      expect(form.getState().values.b).toBe(1); // undefined + 1 via (0 + 1)
++    });
++
++    it("should work when computed field values is updated before subscribers fire", () => {
++      // This tests the critical requirement that computed values are in
++      // getState().values BEFORE any subscribers are notified
++      const form = createForm({
++        onSubmit: onSubmitMock,
++        initialValues: { x: 1 },
++      });
++      form.registerField("x", () => {}, { value: true });
++      form.registerComputedField("doubled", {
++        compute: (values) => (values.x || 0) * 2,
++        dependsOn: ["x"],
++      });
++
++      let valuesDuringNotification: any = null;
++      form.subscribe((state) => {
++        valuesDuringNotification = { ...state.values };
++      }, { values: true });
++
++      form.change("x", 5);
++      expect(valuesDuringNotification).not.toBeNull();
++      expect(valuesDuringNotification.doubled).toBe(10);
++    });
++
++    it("should handle re-registration of a computed field after unsubscribe", () => {
++      const form = createForm({
++        onSubmit: onSubmitMock,
++        initialValues: { x: 3 },
++      });
++      form.registerField("x", () => {}, { value: true });
++
++      const unsub1 = form.registerComputedField("comp", {
++        compute: (values) => (values.x || 0) + 100,
++        dependsOn: ["x"],
++      });
++      expect(form.getState().values.comp).toBe(103);
++      unsub1();
++      expect(form.getState().values.comp).toBeUndefined();
++
++      // Re-register with a different compute function
++      form.registerComputedField("comp", {
++        compute: (values) => (values.x || 0) + 200,
++        dependsOn: ["x"],
++      });
++      expect(form.getState().values.comp).toBe(203);
++    });
++  });
++});
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..fa2fcd8
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,13 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++MODE="${1:-new}"
++
++if [ "$MODE" = "base" ]; then
++  npx jest --no-coverage --testPathIgnorePatterns='computedFields'
++elif [ "$MODE" = "new" ]; then
++  npx jest --no-coverage --testPathPattern='computedFields'
++else
++  echo "Usage: $0 [base|new]" >&2
++  exit 1
++fi

@@ -1,0 +1,631 @@
+diff --git a/src/FinalForm.ts b/src/FinalForm.ts
+index 2bbee06..1a2911f 100644
+--- a/src/FinalForm.ts
++++ b/src/FinalForm.ts
+@@ -6,8 +6,10 @@ import filterFormState from "./filterFormState";
+ import memoize from "./memoize";
+ import isPromise from "./isPromise";
+ import shallowEqual from "./shallowEqual";
++import { createComputedFieldGraph, ComputedFieldGraph } from "./computedFields";
+ import {
+   ChangeValue,
++  ComputedFieldConfig,
+   Config,
+   ConfigKey,
+   FieldConfig,
+@@ -221,6 +223,11 @@ function createForm<
+     return result;
+   };
+ 
++  const computedFieldGraph: ComputedFieldGraph<FormValues> =
++    createComputedFieldGraph<FormValues>();
++  let batchDirtyComputedFields: Set<string> = new Set();
++  const computedFieldNames: Set<string> = new Set();
++
+   const scheduleAsyncCallbacks = () => {
+     if (!asyncCallbacksScheduled && pendingAsyncCallbacks.length > 0) {
+       asyncCallbacksScheduled = true;
+@@ -243,6 +250,30 @@ function createForm<
+     }
+   };
+ 
++  const recomputeAllComputedFields = (): void => {
++    if (computedFieldNames.size === 0) return;
++    state.formState.values = computedFieldGraph.evaluateAll(
++      state.formState.values,
++    );
++  };
++
++  const recomputeAffectedComputedFields = (changedFields: string[]): void => {
++    if (computedFieldNames.size === 0) return;
++    if (inBatch) {
++      for (const field of changedFields) {
++        const affected = computedFieldGraph.getAffectedComputedFields(field);
++        for (const name of affected) {
++          batchDirtyComputedFields.add(name);
++        }
++      }
++      return;
++    }
++    state.formState.values = computedFieldGraph.evaluateAffected(
++      changedFields,
++      state.formState.values,
++    );
++  };
++
+   const changeValue: ChangeValue<FormValues, InitialFormValues> = (state, name, mutate) => {
+     const before = getIn(state.formState.values as object, name);
+     const after = mutate(before);
+@@ -299,6 +330,7 @@ function createForm<
+       state.fields = mutatableState.fields;
+       state.fieldSubscribers = mutatableState.fieldSubscribers;
+       state.lastFormState = mutatableState.lastFormState;
++      recomputeAllComputedFields();
+       runValidation(undefined, () => {
+         notifyFieldListeners(undefined);
+         notifyFormListeners();
+@@ -725,6 +757,13 @@ function createForm<
+       inBatch++;
+       fn();
+       inBatch--;
++      if (!inBatch && batchDirtyComputedFields.size > 0) {
++        const dirtyFields = Array.from(batchDirtyComputedFields);
++        batchDirtyComputedFields = new Set();
++        state.formState.values = computedFieldGraph.evaluateAll(
++          state.formState.values,
++        );
++      }
+       notifyFieldListeners(undefined);
+       notifyFormListeners();
+     },
+@@ -753,6 +792,11 @@ function createForm<
+     },
+ 
+     change: <F extends keyof FormValues>(name: F, value?: FormValues[F]) => {
++      if (computedFieldNames.has(name as string)) {
++        throw new Error(
++          `Cannot change computed field "${String(name)}". Computed fields are read-only.`,
++        );
++      }
+       const { fields, formState } = state;
+       if (getIn(formState.values as object, name as string) !== value) {
+         changeValue(state, name as string, () => value);
+@@ -765,6 +809,7 @@ function createForm<
+             modifiedSinceLastSubmit: !!formState.lastSubmittedValues,
+           };
+         }
++        recomputeAffectedComputedFields([name as string]);
+         if (validateOnBlur) {
+           notifyFieldListeners(undefined);
+           notifyFormListeners();
+@@ -843,6 +888,7 @@ function createForm<
+         formState.values =
+           ((setIn(formState.values as object, key, savedDirtyValues[key]) as unknown) as FormValues) || ({} as FormValues);
+       });
++      recomputeAllComputedFields();
+       runValidation(undefined, () => {
+         notifyFieldListeners(undefined);
+         notifyFormListeners();
+@@ -1005,6 +1051,10 @@ function createForm<
+             });
+           } else if (lastOne) {
+             // values or errors may have changed
++            // If this field is a dependency of computed fields, recompute them
++            if (computedFieldNames.size > 0) {
++              recomputeAffectedComputedFields([name as string]);
++            }
+             notifyFormListeners();
+           }
+         }
+@@ -1222,8 +1272,13 @@ function createForm<
+       formState.lastSubmittedValues = { ...formState.values };
+       resetModifiedAfterSubmit();
+ 
++      // Strip computed fields with excludeFromSubmit from the submitted values
++      const submitValues = computedFieldGraph.stripExcludedFromSubmit(
++        formState.values,
++      );
++
+       // onSubmit is either sync, callback or async with a Promise
+-      const result = onSubmit(formState.values, api, complete);
++      const result = onSubmit(submitValues, api, complete);
+ 
+       if (!completeCalled) {
+         if (result && isPromise(result)) {
+@@ -1327,6 +1382,98 @@ function createForm<
+     getFormSnapshot: (): FormState<FormValues, InitialFormValues> => {
+       return calculateNextFormState();
+     },
++
++    registerComputedField: (
++      name: string,
++      config: ComputedFieldConfig<FormValues>,
++    ): Unsubscribe => {
++      computedFieldGraph.register(name, config);
++      computedFieldNames.add(name);
++
++      // Create an internal field state entry for the computed field
++      if (!state.fields[name]) {
++        state.fields[name] = {
++          active: false,
++          blur: () => {},
++          change: () => {
++            throw new Error(
++              `Cannot change computed field "${name}". Computed fields are read-only.`,
++            );
++          },
++          data: {},
++          focus: () => {},
++          isEqual: tripleEquals,
++          lastFieldState: undefined,
++          modified: false,
++          modifiedSinceLastSubmit: false,
++          name,
++          touched: false,
++          valid: true,
++          validateFields: undefined,
++          validators: {},
++          validating: false,
++          visited: false,
++        };
++      }
++
++      if (!state.fieldSubscribers[name]) {
++        state.fieldSubscribers[name] = { index: 0, entries: {} };
++      }
++
++      // Compute initial value
++      recomputeAllComputedFields();
++
++      // Set the initial value for the computed field so dirty/pristine works
++      const computedValue = getIn(
++        state.formState.values as object,
++        name,
++      );
++      state.formState.initialValues = (setIn(
++        state.formState.initialValues || {},
++        name,
++        computedValue,
++      ) as InitialFormValues);
++
++      // Re-run validation so record-level validators can see computed values
++      runValidation(undefined, () => {
++        notifyFieldListeners(undefined);
++        notifyFormListeners();
++      });
++
++      return () => {
++        computedFieldGraph.unregister(name);
++        computedFieldNames.delete(name);
++
++        // Remove the computed value from form values
++        state.formState.values = (setIn(
++          state.formState.values as object,
++          name,
++          undefined,
++          true,
++        ) as FormValues) || ({} as FormValues);
++
++        // Remove initial value
++        if (state.formState.initialValues) {
++          state.formState.initialValues = (setIn(
++            state.formState.initialValues as object,
++            name,
++            undefined,
++            true,
++          ) as InitialFormValues);
++        }
++
++        // Clean up field state and subscribers
++        delete state.fields[name];
++        delete state.fieldSubscribers[name];
++        delete state.lastFormState;
++
++        // Recompute remaining computed fields (some may depend on the removed one)
++        recomputeAllComputedFields();
++
++        notifyFieldListeners(undefined);
++        notifyFormListeners();
++      };
++    },
+   };
+   return api;
+ }
+diff --git a/src/computedFields.ts b/src/computedFields.ts
+new file mode 100644
+index 0000000..807aa73
+--- /dev/null
++++ b/src/computedFields.ts
+@@ -0,0 +1,340 @@
++import getIn from "./structure/getIn";
++import setIn from "./structure/setIn";
++import type { ComputedFieldConfig, ComputedFieldEntry } from "./types";
++
++/**
++ * Manages a directed acyclic graph (DAG) of computed field dependencies.
++ * Supports topological sort for evaluation ordering, cycle detection,
++ * and memoized lazy evaluation of computed values.
++ */
++export class ComputedFieldGraph<FormValues = Record<string, any>> {
++  private entries: Map<string, ComputedFieldEntry<FormValues>> = new Map();
++  private adjacency: Map<string, Set<string>> = new Map();
++  private reverseAdjacency: Map<string, Set<string>> = new Map();
++  private sortedOrder: string[] = [];
++  private orderDirty: boolean = true;
++
++  register(
++    name: string,
++    config: ComputedFieldConfig<FormValues>,
++  ): void {
++    if (this.wouldCreateCycle(name, config.dependsOn)) {
++      throw new Error(
++        `Cannot register computed field "${name}": circular dependency detected`,
++      );
++    }
++
++    const entry: ComputedFieldEntry<FormValues> = {
++      name,
++      compute: config.compute,
++      dependsOn: [...config.dependsOn],
++      excludeFromSubmit: config.excludeFromSubmit || false,
++      lastDependencyValues: undefined,
++      lastComputedValue: undefined,
++      initialized: false,
++    };
++
++    this.entries.set(name, entry);
++
++    if (!this.adjacency.has(name)) {
++      this.adjacency.set(name, new Set());
++    }
++
++    for (const dep of config.dependsOn) {
++      if (!this.reverseAdjacency.has(dep)) {
++        this.reverseAdjacency.set(dep, new Set());
++      }
++      this.reverseAdjacency.get(dep)!.add(name);
++      this.adjacency.get(name)!.add(dep);
++    }
++
++    this.orderDirty = true;
++  }
++
++  unregister(name: string): void {
++    const entry = this.entries.get(name);
++    if (!entry) return;
++
++    for (const dep of entry.dependsOn) {
++      const rev = this.reverseAdjacency.get(dep);
++      if (rev) {
++        rev.delete(name);
++        if (rev.size === 0) {
++          this.reverseAdjacency.delete(dep);
++        }
++      }
++    }
++
++    this.adjacency.delete(name);
++    this.entries.delete(name);
++    this.orderDirty = true;
++  }
++
++  has(name: string): boolean {
++    return this.entries.has(name);
++  }
++
++  getEntry(name: string): ComputedFieldEntry<FormValues> | undefined {
++    return this.entries.get(name);
++  }
++
++  getAll(): ComputedFieldEntry<FormValues>[] {
++    return Array.from(this.entries.values());
++  }
++
++  getAllNames(): string[] {
++    return Array.from(this.entries.keys());
++  }
++
++  getExcludeFromSubmitNames(): string[] {
++    const result: string[] = [];
++    for (const [name, entry] of this.entries) {
++      if (entry.excludeFromSubmit) {
++        result.push(name);
++      }
++    }
++    return result;
++  }
++
++  getDependents(fieldName: string): string[] {
++    const rev = this.reverseAdjacency.get(fieldName);
++    if (!rev) return [];
++    return Array.from(rev);
++  }
++
++  getAffectedComputedFields(changedField: string): string[] {
++    const affected = new Set<string>();
++    const queue: string[] = [changedField];
++
++    while (queue.length > 0) {
++      const current = queue.shift()!;
++      const dependents = this.getDependents(current);
++      for (const dep of dependents) {
++        if (!affected.has(dep)) {
++          affected.add(dep);
++          queue.push(dep);
++        }
++      }
++    }
++
++    return this.filterAndSortByTopologicalOrder(affected);
++  }
++
++  getTopologicalOrder(): string[] {
++    if (this.orderDirty) {
++      this.sortedOrder = this.computeTopologicalSort();
++      this.orderDirty = false;
++    }
++    return this.sortedOrder;
++  }
++
++  evaluateAll(values: FormValues): FormValues {
++    const order = this.getTopologicalOrder();
++    let currentValues = values;
++
++    for (const name of order) {
++      const entry = this.entries.get(name);
++      if (!entry) continue;
++
++      const depValues = this.extractDependencyValues(
++        entry.dependsOn,
++        currentValues,
++      );
++
++      if (entry.initialized && this.areDependencyValuesIdentical(entry, depValues)) {
++        currentValues = this.injectValue(
++          currentValues,
++          name,
++          entry.lastComputedValue,
++        );
++        continue;
++      }
++
++      const computedValue = entry.compute(currentValues);
++      entry.lastDependencyValues = depValues;
++      entry.lastComputedValue = computedValue;
++      entry.initialized = true;
++
++      currentValues = this.injectValue(currentValues, name, computedValue);
++    }
++
++    return currentValues;
++  }
++
++  evaluateAffected(
++    changedFields: string[],
++    values: FormValues,
++  ): FormValues {
++    const allAffected = new Set<string>();
++    for (const field of changedFields) {
++      const affected = this.getAffectedComputedFields(field);
++      for (const name of affected) {
++        allAffected.add(name);
++      }
++    }
++
++    if (allAffected.size === 0) {
++      return values;
++    }
++
++    const sortedAffected = this.filterAndSortByTopologicalOrder(allAffected);
++    let currentValues = values;
++
++    for (const name of sortedAffected) {
++      const entry = this.entries.get(name);
++      if (!entry) continue;
++
++      const depValues = this.extractDependencyValues(
++        entry.dependsOn,
++        currentValues,
++      );
++
++      if (entry.initialized && this.areDependencyValuesIdentical(entry, depValues)) {
++        currentValues = this.injectValue(
++          currentValues,
++          name,
++          entry.lastComputedValue,
++        );
++        continue;
++      }
++
++      const computedValue = entry.compute(currentValues);
++      entry.lastDependencyValues = depValues;
++      entry.lastComputedValue = computedValue;
++      entry.initialized = true;
++
++      currentValues = this.injectValue(currentValues, name, computedValue);
++    }
++
++    return currentValues;
++  }
++
++  removeComputedValue(values: FormValues, name: string): FormValues {
++    return (setIn(values as object, name, undefined, true) || {}) as FormValues;
++  }
++
++  stripExcludedFromSubmit(values: FormValues): FormValues {
++    let result = { ...values } as FormValues;
++    const excludeNames = this.getExcludeFromSubmitNames();
++    for (const name of excludeNames) {
++      result = (setIn(result as object, name, undefined, true) || {}) as FormValues;
++    }
++    return result;
++  }
++
++  private wouldCreateCycle(newNode: string, dependencies: string[]): boolean {
++    if (dependencies.includes(newNode)) {
++      return true;
++    }
++
++    for (const dep of dependencies) {
++      if (this.canReach(newNode, dep)) {
++        return true;
++      }
++    }
++
++    return false;
++  }
++
++  private canReach(from: string, to: string): boolean {
++    const visited = new Set<string>();
++    const stack: string[] = [to];
++
++    while (stack.length > 0) {
++      const current = stack.pop()!;
++      if (current === from) return false;
++      if (visited.has(current)) continue;
++      visited.add(current);
++
++      const entry = this.entries.get(current);
++      if (entry) {
++        for (const dep of entry.dependsOn) {
++          if (dep === from) {
++            return true;
++          }
++          if (!visited.has(dep)) {
++            stack.push(dep);
++          }
++        }
++      }
++    }
++
++    return false;
++  }
++
++  private computeTopologicalSort(): string[] {
++    const result: string[] = [];
++    const visited = new Set<string>();
++    const visiting = new Set<string>();
++
++    const visit = (name: string) => {
++      if (visited.has(name)) return;
++      if (visiting.has(name)) {
++        throw new Error(
++          `Cycle detected during topological sort involving "${name}"`,
++        );
++      }
++
++      visiting.add(name);
++      const entry = this.entries.get(name);
++      if (entry) {
++        for (const dep of entry.dependsOn) {
++          if (this.entries.has(dep)) {
++            visit(dep);
++          }
++        }
++      }
++      visiting.delete(name);
++      visited.add(name);
++      result.push(name);
++    };
++
++    for (const name of this.entries.keys()) {
++      visit(name);
++    }
++
++    return result;
++  }
++
++  private filterAndSortByTopologicalOrder(names: Set<string>): string[] {
++    const order = this.getTopologicalOrder();
++    return order.filter((name) => names.has(name));
++  }
++
++  private extractDependencyValues(
++    dependsOn: string[],
++    values: FormValues,
++  ): any[] {
++    return dependsOn.map((dep) => getIn(values as object, dep));
++  }
++
++  private areDependencyValuesIdentical(
++    entry: ComputedFieldEntry<FormValues>,
++    currentDepValues: any[],
++  ): boolean {
++    if (!entry.lastDependencyValues) return false;
++    if (entry.lastDependencyValues.length !== currentDepValues.length)
++      return false;
++
++    for (let i = 0; i < currentDepValues.length; i++) {
++      if (entry.lastDependencyValues[i] !== currentDepValues[i]) {
++        return false;
++      }
++    }
++    return true;
++  }
++
++  private injectValue(
++    values: FormValues,
++    name: string,
++    value: any,
++  ): FormValues {
++    return (setIn(values as object, name, value) || {}) as FormValues;
++  }
++}
++
++export function createComputedFieldGraph<
++  FormValues = Record<string, any>,
++>(): ComputedFieldGraph<FormValues> {
++  return new ComputedFieldGraph<FormValues>();
++}
+diff --git a/src/index.ts b/src/index.ts
+index a2d82d4..6b6a7cc 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -4,6 +4,7 @@ export { default as formSubscriptionItems } from "./formSubscriptionItems";
+ export { default as fieldSubscriptionItems } from "./fieldSubscriptionItems";
+ export { default as getIn } from "./structure/getIn";
+ export { default as setIn } from "./structure/setIn";
++export { ComputedFieldGraph, createComputedFieldGraph } from "./computedFields";
+ 
+ // Export all types
+ export * from "./types"; 
+\ No newline at end of file
+diff --git a/src/types.ts b/src/types.ts
+index a01ba90..1c27164 100644
+--- a/src/types.ts
++++ b/src/types.ts
+@@ -294,6 +294,10 @@ export interface FormApi<
+    */
+   getFormSnapshot: () => FormState<FormValues, InitialFormValues>;
+   ignoreUnregister: boolean;
++  registerComputedField: (
++    name: string,
++    config: ComputedFieldConfig<FormValues>,
++  ) => Unsubscribe;
+ }
+ 
+ export type DebugFunction<
+@@ -390,4 +394,20 @@ export type StateFilter<T> = (
+   previousState: T | undefined,
+   subscription: Subscription,
+   force: boolean
+-) => T | undefined; 
+\ No newline at end of file
++) => T | undefined;
++
++export interface ComputedFieldConfig<FormValues = Record<string, any>> {
++  compute: (values: FormValues) => any;
++  dependsOn: string[];
++  excludeFromSubmit?: boolean;
++}
++
++export interface ComputedFieldEntry<FormValues = Record<string, any>> {
++  name: string;
++  compute: (values: FormValues) => any;
++  dependsOn: string[];
++  excludeFromSubmit: boolean;
++  lastDependencyValues: any[] | undefined;
++  lastComputedValue: any;
++  initialized: boolean;
++}
+\ No newline at end of file

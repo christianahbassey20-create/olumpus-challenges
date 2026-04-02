@@ -1,0 +1,1113 @@
+diff --git a/ninja_extra/controllers/model/builder.py b/ninja_extra/controllers/model/builder.py
+index 3f5dff2..5df3316 100644
+--- a/ninja_extra/controllers/model/builder.py
++++ b/ninja_extra/controllers/model/builder.py
+@@ -188,6 +188,83 @@ class ModelControllerBuilder:
+ 
+         self._add_to_controller(delete_item.setup(self._base_cls))
+ 
++    def _get_bulk_config_params(self) -> dict:
++        if self._config.bulk_config:
++            return {
++                "atomic": self._config.bulk_config.atomic,
++                "max_items": self._config.bulk_config.max_items,
++            }
++        return {"atomic": True, "max_items": 100}
++
++    def _register_bulk_create_endpoint(self) -> None:
++        bulk_params = self._get_bulk_config_params()
++        kw = {
++            "url_name": f"{self._model_name.lower()}-bulk-create",
++            "description": f"Bulk create {self._model_name} items",
++            "summary": "Bulk create items",
++        }
++        kw.update(self._config.bulk_create_route_info)
++        bulk_create_items = self._route_factory.bulk_create(
++            schema_in=self._create_schema,  # type:ignore[arg-type]
++            path="/bulk",
++            **kw,  # type:ignore[arg-type]
++            **bulk_params,
++        )
++        self._add_to_controller(bulk_create_items.setup(self._base_cls))
++
++    def _register_bulk_update_endpoint(self) -> None:
++        bulk_params = self._get_bulk_config_params()
++        kw = {
++            "url_name": f"{self._model_name.lower()}-bulk-update",
++            "description": f"Bulk update {self._model_name} items",
++            "summary": "Bulk update items",
++        }
++        kw.update(self._config.bulk_update_route_info)
++        bulk_update_items = self._route_factory.bulk_update(
++            path="/bulk",
++            lookup_param=self._model_pk_name,
++            schema_in=self._update_schema,  # type:ignore[arg-type]
++            pk_type=self._pk_type,
++            **kw,  # type:ignore[arg-type]
++            **bulk_params,
++        )
++        self._add_to_controller(bulk_update_items.setup(self._base_cls))
++
++    def _register_bulk_patch_endpoint(self) -> None:
++        bulk_params = self._get_bulk_config_params()
++        kw = {
++            "url_name": f"{self._model_name.lower()}-bulk-patch",
++            "description": f"Bulk patch {self._model_name} items",
++            "summary": "Bulk patch items",
++        }
++        kw.update(self._config.bulk_patch_route_info)
++        bulk_patch_items = self._route_factory.bulk_patch(
++            path="/bulk",
++            lookup_param=self._model_pk_name,
++            schema_in=self._patch_schema,  # type:ignore[arg-type]
++            pk_type=self._pk_type,
++            **kw,  # type:ignore[arg-type]
++            **bulk_params,
++        )
++        self._add_to_controller(bulk_patch_items.setup(self._base_cls))
++
++    def _register_bulk_delete_endpoint(self) -> None:
++        bulk_params = self._get_bulk_config_params()
++        kw = {
++            "url_name": f"{self._model_name.lower()}-bulk-delete",
++            "description": f"Bulk delete {self._model_name} items",
++            "summary": "Bulk delete items",
++        }
++        kw.update(self._config.bulk_delete_route_info)
++        bulk_delete_items = self._route_factory.bulk_delete(
++            path="/bulk/delete",
++            pk_type=self._pk_type,
++            lookup_param=self._model_pk_name,
++            **kw,  # type:ignore[arg-type]
++            **bulk_params,
++        )
++        self._add_to_controller(bulk_delete_items.setup(self._base_cls))
++
+     def register_model_routes(self) -> None:
+         for action in self._config.allowed_routes:
+             action_registration = getattr(self, f"_register_{action}_endpoint", None)
+diff --git a/ninja_extra/controllers/model/endpoints.py b/ninja_extra/controllers/model/endpoints.py
+index 96dacb2..9dbec4b 100644
+--- a/ninja_extra/controllers/model/endpoints.py
++++ b/ninja_extra/controllers/model/endpoints.py
+@@ -3,13 +3,14 @@ import uuid
+ 
+ from django.db.models import Model as DjangoModel
+ from django.db.models import QuerySet
+-from ninja import FilterSchema
++from ninja import FilterSchema, Schema
+ from ninja.constants import NOT_SET, NOT_SET_TYPE
+ from ninja.pagination import PaginationBase
+ from ninja.params import Body
+ from ninja.signature import is_async
+ from ninja.throttling import BaseThrottle
+ from pydantic import BaseModel as PydanticModel
++from pydantic import create_model
+ 
+ from ninja_extra import status
+ from ninja_extra.controllers.model.path_resolver import (
+@@ -24,6 +25,7 @@ from ninja_extra.pagination import (
+     paginate,
+ )
+ from ninja_extra.permissions import BasePermission
++from ninja_extra.controllers.model.schemas import BulkOperationError, BulkOperationResponse
+ 
+ if t.TYPE_CHECKING:
+     from ninja_extra.controllers.base import ModelControllerBase
+@@ -682,6 +684,415 @@ class ModelEndpointFactory:
+         create_item.__name__ = cls._change_name("create_item")
+         return create_item
+ 
++    # ── Bulk factory methods ────────────────────────────────
++
++    @classmethod
++    def bulk_create(
++        cls,
++        schema_in: t.Type[PydanticModel],
++        path: str = "/bulk",
++        status_code: int = status.HTTP_200_OK,
++        auth: t.Any = NOT_SET,
++        throttle: t.Union[BaseThrottle, t.List[BaseThrottle], NOT_SET_TYPE] = NOT_SET,
++        response: t.Any = NOT_SET,
++        url_name: t.Optional[str] = None,
++        description: t.Optional[str] = None,
++        operation_id: t.Optional[str] = None,
++        summary: t.Optional[str] = "Bulk create items",
++        tags: t.Optional[t.List[str]] = None,
++        deprecated: t.Optional[bool] = None,
++        by_alias: bool = False,
++        exclude_unset: bool = False,
++        exclude_defaults: bool = False,
++        exclude_none: bool = False,
++        include_in_schema: bool = True,
++        permissions: t.Optional[
++            t.List[t.Union[t.Type[BasePermission], BasePermission, t.Any]]
++        ] = None,
++        openapi_extra: t.Optional[t.Dict[str, t.Any]] = None,
++        atomic: bool = True,
++        max_items: int = 100,
++    ) -> "ModelEndpointFunction":
++        def _setup(model_controller_type: t.Type["ModelControllerBase"]) -> t.Callable:
++            api_controller = model_controller_type.get_api_controller()
++            working_path = cls._clean_path(path)
++            handler = _path_resolver(
++                path,
++                cls._bulk_create_handler(
++                    schema_in=schema_in, atomic=atomic, max_items=max_items,
++                ),
++                prefix_route_params=api_controller.prefix_route_params,
++            )
++            return route.post(
++                working_path,
++                response=response if response is not NOT_SET else {status_code: BulkOperationResponse},
++                url_name=url_name, description=description, operation_id=operation_id,
++                summary=summary, tags=tags, deprecated=deprecated, by_alias=by_alias,
++                exclude_unset=exclude_unset, exclude_defaults=exclude_defaults,
++                exclude_none=exclude_none, include_in_schema=include_in_schema,
++                permissions=permissions, openapi_extra=openapi_extra,
++                auth=auth, throttle=throttle,
++            )(handler)
++        return ModelEndpointFunction(view_fun_setup=_setup)
++
++    @classmethod
++    def bulk_update(
++        cls,
++        path: str,
++        lookup_param: str,
++        schema_in: t.Type[PydanticModel],
++        pk_type: t.Type = int,
++        status_code: int = status.HTTP_200_OK,
++        auth: t.Any = NOT_SET,
++        throttle: t.Union[BaseThrottle, t.List[BaseThrottle], NOT_SET_TYPE] = NOT_SET,
++        response: t.Any = NOT_SET,
++        url_name: t.Optional[str] = None,
++        description: t.Optional[str] = None,
++        operation_id: t.Optional[str] = None,
++        summary: t.Optional[str] = "Bulk update items",
++        tags: t.Optional[t.List[str]] = None,
++        deprecated: t.Optional[bool] = None,
++        by_alias: bool = False,
++        exclude_unset: bool = False,
++        exclude_defaults: bool = False,
++        exclude_none: bool = False,
++        include_in_schema: bool = True,
++        permissions: t.Optional[
++            t.List[t.Union[t.Type[BasePermission], BasePermission, t.Any]]
++        ] = None,
++        openapi_extra: t.Optional[t.Dict[str, t.Any]] = None,
++        atomic: bool = True,
++        max_items: int = 100,
++    ) -> "ModelEndpointFunction":
++        def _setup(model_controller_type: t.Type["ModelControllerBase"]) -> t.Callable:
++            api_controller = model_controller_type.get_api_controller()
++            working_path = cls._clean_path(path)
++            bulk_update_schema = create_model(
++                f"BulkUpdate{cls._change_name('Schema')}",
++                __base__=schema_in,
++                **{lookup_param: (pk_type, ...)},
++            )
++            handler = _path_resolver(
++                path,
++                cls._bulk_update_handler(
++                    schema_in=bulk_update_schema, lookup_param=lookup_param,
++                    atomic=atomic, max_items=max_items,
++                ),
++                prefix_route_params=api_controller.prefix_route_params,
++            )
++            return route.put(
++                working_path,
++                response=response if response is not NOT_SET else {status_code: BulkOperationResponse},
++                url_name=url_name, description=description, operation_id=operation_id,
++                summary=summary, tags=tags, deprecated=deprecated, by_alias=by_alias,
++                exclude_unset=exclude_unset, exclude_defaults=exclude_defaults,
++                exclude_none=exclude_none, include_in_schema=include_in_schema,
++                permissions=permissions, openapi_extra=openapi_extra,
++                auth=auth, throttle=throttle,
++            )(handler)
++        return ModelEndpointFunction(_setup)
++
++    @classmethod
++    def bulk_patch(
++        cls,
++        path: str,
++        lookup_param: str,
++        schema_in: t.Type[PydanticModel],
++        pk_type: t.Type = int,
++        status_code: int = status.HTTP_200_OK,
++        auth: t.Any = NOT_SET,
++        throttle: t.Union[BaseThrottle, t.List[BaseThrottle], NOT_SET_TYPE] = NOT_SET,
++        response: t.Any = NOT_SET,
++        url_name: t.Optional[str] = None,
++        description: t.Optional[str] = None,
++        operation_id: t.Optional[str] = None,
++        summary: t.Optional[str] = "Bulk patch items",
++        tags: t.Optional[t.List[str]] = None,
++        deprecated: t.Optional[bool] = None,
++        by_alias: bool = False,
++        exclude_unset: bool = False,
++        exclude_defaults: bool = False,
++        exclude_none: bool = False,
++        include_in_schema: bool = True,
++        permissions: t.Optional[
++            t.List[t.Union[t.Type[BasePermission], BasePermission, t.Any]]
++        ] = None,
++        openapi_extra: t.Optional[t.Dict[str, t.Any]] = None,
++        atomic: bool = True,
++        max_items: int = 100,
++    ) -> "ModelEndpointFunction":
++        def _setup(model_controller_type: t.Type["ModelControllerBase"]) -> t.Callable:
++            api_controller = model_controller_type.get_api_controller()
++            working_path = cls._clean_path(path)
++            bulk_patch_schema = create_model(
++                f"BulkPatch{cls._change_name('Schema')}",
++                __base__=schema_in,
++                **{lookup_param: (pk_type, ...)},
++            )
++            handler = _path_resolver(
++                path,
++                cls._bulk_patch_handler(
++                    schema_in=bulk_patch_schema, lookup_param=lookup_param,
++                    atomic=atomic, max_items=max_items,
++                ),
++                prefix_route_params=api_controller.prefix_route_params,
++            )
++            return route.patch(
++                working_path,
++                response=response if response is not NOT_SET else {status_code: BulkOperationResponse},
++                url_name=url_name, description=description, operation_id=operation_id,
++                summary=summary, tags=tags, deprecated=deprecated, by_alias=by_alias,
++                exclude_unset=exclude_unset, exclude_defaults=exclude_defaults,
++                exclude_none=exclude_none, include_in_schema=include_in_schema,
++                permissions=permissions, openapi_extra=openapi_extra,
++                auth=auth, throttle=throttle,
++            )(handler)
++        return ModelEndpointFunction(_setup)
++
++    @classmethod
++    def bulk_delete(
++        cls,
++        path: str = "/bulk/delete",
++        pk_type: t.Type = int,
++        lookup_param: str = "id",
++        status_code: int = status.HTTP_200_OK,
++        auth: t.Any = NOT_SET,
++        throttle: t.Union[BaseThrottle, t.List[BaseThrottle], NOT_SET_TYPE] = NOT_SET,
++        response: t.Any = NOT_SET,
++        url_name: t.Optional[str] = None,
++        description: t.Optional[str] = None,
++        operation_id: t.Optional[str] = None,
++        summary: t.Optional[str] = "Bulk delete items",
++        tags: t.Optional[t.List[str]] = None,
++        deprecated: t.Optional[bool] = None,
++        by_alias: bool = False,
++        exclude_unset: bool = False,
++        exclude_defaults: bool = False,
++        exclude_none: bool = False,
++        include_in_schema: bool = True,
++        permissions: t.Optional[
++            t.List[t.Union[t.Type[BasePermission], BasePermission, t.Any]]
++        ] = None,
++        openapi_extra: t.Optional[t.Dict[str, t.Any]] = None,
++        atomic: bool = True,
++        max_items: int = 100,
++    ) -> "ModelEndpointFunction":
++        def _setup(model_controller_type: t.Type["ModelControllerBase"]) -> t.Callable:
++            api_controller = model_controller_type.get_api_controller()
++            working_path = cls._clean_path(path)
++            bulk_delete_schema = create_model(
++                f"BulkDelete{cls._change_name('Schema')}",
++                __base__=Schema,
++                ids=(t.List[pk_type], ...),
++            )
++            handler = _path_resolver(
++                path,
++                cls._bulk_delete_handler(
++                    schema_in=bulk_delete_schema, lookup_param=lookup_param,
++                    atomic=atomic, max_items=max_items,
++                ),
++                prefix_route_params=api_controller.prefix_route_params,
++            )
++            return route.post(
++                working_path,
++                response=response if response is not NOT_SET else {status_code: BulkOperationResponse},
++                url_name=url_name, description=description, operation_id=operation_id,
++                summary=summary, tags=tags, deprecated=deprecated, by_alias=by_alias,
++                exclude_unset=exclude_unset, exclude_defaults=exclude_defaults,
++                exclude_none=exclude_none, include_in_schema=include_in_schema,
++                permissions=permissions, openapi_extra=openapi_extra,
++                auth=auth, throttle=throttle,
++            )(handler)
++        return ModelEndpointFunction(_setup)
++
++    # ── Bulk handlers (sync) ────────────────────────────────
++
++    @classmethod
++    def _bulk_create_handler(
++        cls, *, schema_in: t.Type[PydanticModel], atomic: bool, max_items: int,
++    ) -> t.Callable:
++        def bulk_create_items(
++            self: "ModelControllerBase",
++            data: t.List[schema_in] = Body(default=...),  # type:ignore[valid-type]
++            **kwargs: t.Any,
++        ) -> t.Any:
++            if len(data) > max_items:
++                from ninja_extra.exceptions import ValidationError
++                raise ValidationError(
++                    f"Bulk create accepts at most {max_items} items, got {len(data)}"
++                )
++            try:
++                results = self.service.bulk_create(data, atomic=atomic, **kwargs)
++            except BulkOperationError as exc:
++                total_count = len(data)
++                results = [
++                    {"index": r["index"], "success": False, "status_code": 400,
++                     "data": None, "errors": "Rolled back"} for r in exc.results
++                ]
++                results.append(
++                    {"index": exc.failed_index, "success": False,
++                     "status_code": 400, "data": None, "errors": str(exc)}
++                )
++                for i in range(exc.failed_index + 1, total_count):
++                    results.append(
++                        {"index": i, "success": False, "status_code": 400,
++                         "data": None, "errors": "Skipped"}
++                    )
++            succeeded = sum(1 for r in results if r["success"])
++            return {
++                "total": len(results), "succeeded": succeeded,
++                "failed": len(results) - succeeded, "results": results,
++            }
++        bulk_create_items.__name__ = cls._change_name("bulk_create_items")
++        return bulk_create_items
++
++    @classmethod
++    def _bulk_update_handler(
++        cls, *, schema_in: t.Type[PydanticModel], lookup_param: str,
++        atomic: bool, max_items: int,
++    ) -> t.Callable:
++        def bulk_update_items(
++            self: "ModelControllerBase",
++            data: t.List[schema_in] = Body(default=...),  # type:ignore[valid-type]
++            **kwargs: t.Any,
++        ) -> t.Any:
++            if len(data) > max_items:
++                from ninja_extra.exceptions import ValidationError
++                raise ValidationError(
++                    f"Bulk update accepts at most {max_items} items, got {len(data)}"
++                )
++            items = []
++            for item_schema in data:
++                item_data = item_schema.model_dump()
++                pk = item_data.pop(lookup_param)
++                DynSchema = create_model(
++                    "DynUpdateSchema", **{k: (t.Any, ...) for k in item_data},
++                )
++                items.append({"pk": pk, "schema": DynSchema(**item_data)})
++            try:
++                results = self.service.bulk_update(
++                    items, atomic=atomic, lookup_field=lookup_param,
++                    check_permissions=self.check_object_permissions, **kwargs,
++                )
++            except BulkOperationError as exc:
++                total_count = len(data)
++                results = [
++                    {"index": r["index"], "success": False, "status_code": 404,
++                     "data": None, "errors": "Rolled back"} for r in exc.results
++                ]
++                results.append(
++                    {"index": exc.failed_index, "success": False,
++                     "status_code": 404, "data": None, "errors": str(exc)}
++                )
++                for i in range(exc.failed_index + 1, total_count):
++                    results.append(
++                        {"index": i, "success": False, "status_code": 404,
++                         "data": None, "errors": "Skipped"}
++                    )
++            succeeded = sum(1 for r in results if r["success"])
++            return {
++                "total": len(results), "succeeded": succeeded,
++                "failed": len(results) - succeeded, "results": results,
++            }
++        bulk_update_items.__name__ = cls._change_name("bulk_update_items")
++        return bulk_update_items
++
++    @classmethod
++    def _bulk_patch_handler(
++        cls, *, schema_in: t.Type[PydanticModel], lookup_param: str,
++        atomic: bool, max_items: int,
++    ) -> t.Callable:
++        def bulk_patch_items(
++            self: "ModelControllerBase",
++            data: t.List[schema_in] = Body(default=...),  # type:ignore[valid-type]
++            **kwargs: t.Any,
++        ) -> t.Any:
++            if len(data) > max_items:
++                from ninja_extra.exceptions import ValidationError
++                raise ValidationError(
++                    f"Bulk patch accepts at most {max_items} items, got {len(data)}"
++                )
++            items = []
++            for item_schema in data:
++                item_data = item_schema.model_dump(exclude_unset=True)
++                pk = item_data.pop(lookup_param)
++                DynSchema = create_model(
++                    "DynPatchSchema",
++                    **{k: (t.Optional[t.Any], None) for k in item_data},
++                )
++                items.append({"pk": pk, "schema": DynSchema(**item_data)})
++            try:
++                results = self.service.bulk_patch(
++                    items, atomic=atomic, lookup_field=lookup_param,
++                    check_permissions=self.check_object_permissions, **kwargs,
++                )
++            except BulkOperationError as exc:
++                total_count = len(data)
++                results = [
++                    {"index": r["index"], "success": False, "status_code": 404,
++                     "data": None, "errors": "Rolled back"} for r in exc.results
++                ]
++                results.append(
++                    {"index": exc.failed_index, "success": False,
++                     "status_code": 404, "data": None, "errors": str(exc)}
++                )
++                for i in range(exc.failed_index + 1, total_count):
++                    results.append(
++                        {"index": i, "success": False, "status_code": 404,
++                         "data": None, "errors": "Skipped"}
++                    )
++            succeeded = sum(1 for r in results if r["success"])
++            return {
++                "total": len(results), "succeeded": succeeded,
++                "failed": len(results) - succeeded, "results": results,
++            }
++        bulk_patch_items.__name__ = cls._change_name("bulk_patch_items")
++        return bulk_patch_items
++
++    @classmethod
++    def _bulk_delete_handler(
++        cls, *, schema_in: t.Type[PydanticModel], lookup_param: str,
++        atomic: bool, max_items: int,
++    ) -> t.Callable:
++        def bulk_delete_items(
++            self: "ModelControllerBase",
++            data: schema_in = Body(default=...),  # type:ignore[valid-type]
++            **kwargs: t.Any,
++        ) -> t.Any:
++            ids = data.ids
++            if len(ids) > max_items:
++                from ninja_extra.exceptions import ValidationError
++                raise ValidationError(
++                    f"Bulk delete accepts at most {max_items} items, got {len(ids)}"
++                )
++            try:
++                results = self.service.bulk_delete(
++                    ids, atomic=atomic, lookup_field=lookup_param,
++                    check_permissions=self.check_object_permissions, **kwargs,
++                )
++            except BulkOperationError as exc:
++                total_count = len(ids)
++                results = [
++                    {"index": r["index"], "success": False, "status_code": 404,
++                     "data": None, "errors": "Rolled back"} for r in exc.results
++                ]
++                results.append(
++                    {"index": exc.failed_index, "success": False,
++                     "status_code": 404, "data": None, "errors": str(exc)}
++                )
++                for i in range(exc.failed_index + 1, total_count):
++                    results.append(
++                        {"index": i, "success": False, "status_code": 404,
++                         "data": None, "errors": "Skipped"}
++                    )
++            succeeded = sum(1 for r in results if r["success"])
++            return {
++                "total": len(results), "succeeded": succeeded,
++                "failed": len(results) - succeeded, "results": results,
++            }
++        bulk_delete_items.__name__ = cls._change_name("bulk_delete_items")
++        return bulk_delete_items
++
+ 
+ class ModelAsyncEndpointFactory(ModelEndpointFactory):
+     """
+@@ -887,3 +1298,199 @@ class ModelAsyncEndpointFactory(ModelEndpointFactory):
+ 
+         create_item.__name__ = cls._change_name("create_item")
+         return create_item
++
++    # ── Async bulk handlers ─────────────────────────────────
++
++    @classmethod
++    def _bulk_create_handler(
++        cls, *, schema_in: t.Type[PydanticModel], atomic: bool, max_items: int,
++    ) -> t.Callable:
++        async def bulk_create_items(
++            self: "ModelControllerBase",
++            data: t.List[schema_in] = Body(default=...),  # type:ignore[valid-type]
++            **kwargs: t.Any,
++        ) -> t.Any:
++            if len(data) > max_items:
++                from ninja_extra.exceptions import ValidationError
++                raise ValidationError(
++                    f"Bulk create accepts at most {max_items} items, got {len(data)}"
++                )
++            try:
++                results = await _check_if_coroutine(
++                    self.service.bulk_create_async(data, atomic=atomic, **kwargs)
++                )
++            except BulkOperationError as exc:
++                total_count = len(data)
++                results = [
++                    {"index": r["index"], "success": False, "status_code": 400,
++                     "data": None, "errors": "Rolled back"} for r in exc.results
++                ]
++                results.append(
++                    {"index": exc.failed_index, "success": False,
++                     "status_code": 400, "data": None, "errors": str(exc)}
++                )
++                for i in range(exc.failed_index + 1, total_count):
++                    results.append(
++                        {"index": i, "success": False, "status_code": 400,
++                         "data": None, "errors": "Skipped"}
++                    )
++            succeeded = sum(1 for r in results if r["success"])
++            return {
++                "total": len(results), "succeeded": succeeded,
++                "failed": len(results) - succeeded, "results": results,
++            }
++        bulk_create_items.__name__ = cls._change_name("bulk_create_items")
++        return bulk_create_items
++
++    @classmethod
++    def _bulk_update_handler(
++        cls, *, schema_in: t.Type[PydanticModel], lookup_param: str,
++        atomic: bool, max_items: int,
++    ) -> t.Callable:
++        async def bulk_update_items(
++            self: "ModelControllerBase",
++            data: t.List[schema_in] = Body(default=...),  # type:ignore[valid-type]
++            **kwargs: t.Any,
++        ) -> t.Any:
++            if len(data) > max_items:
++                from ninja_extra.exceptions import ValidationError
++                raise ValidationError(
++                    f"Bulk update accepts at most {max_items} items, got {len(data)}"
++                )
++            items = []
++            for item_schema in data:
++                item_data = item_schema.model_dump()
++                pk = item_data.pop(lookup_param)
++                DynSchema = create_model(
++                    "DynUpdateSchema", **{k: (t.Any, ...) for k in item_data},
++                )
++                items.append({"pk": pk, "schema": DynSchema(**item_data)})
++            try:
++                results = await _check_if_coroutine(
++                    self.service.bulk_update_async(
++                        items, atomic=atomic, lookup_field=lookup_param,
++                        check_permissions=self.check_object_permissions, **kwargs,
++                    )
++                )
++            except BulkOperationError as exc:
++                total_count = len(data)
++                results = [
++                    {"index": r["index"], "success": False, "status_code": 404,
++                     "data": None, "errors": "Rolled back"} for r in exc.results
++                ]
++                results.append(
++                    {"index": exc.failed_index, "success": False,
++                     "status_code": 404, "data": None, "errors": str(exc)}
++                )
++                for i in range(exc.failed_index + 1, total_count):
++                    results.append(
++                        {"index": i, "success": False, "status_code": 404,
++                         "data": None, "errors": "Skipped"}
++                    )
++            succeeded = sum(1 for r in results if r["success"])
++            return {
++                "total": len(results), "succeeded": succeeded,
++                "failed": len(results) - succeeded, "results": results,
++            }
++        bulk_update_items.__name__ = cls._change_name("bulk_update_items")
++        return bulk_update_items
++
++    @classmethod
++    def _bulk_patch_handler(
++        cls, *, schema_in: t.Type[PydanticModel], lookup_param: str,
++        atomic: bool, max_items: int,
++    ) -> t.Callable:
++        async def bulk_patch_items(
++            self: "ModelControllerBase",
++            data: t.List[schema_in] = Body(default=...),  # type:ignore[valid-type]
++            **kwargs: t.Any,
++        ) -> t.Any:
++            if len(data) > max_items:
++                from ninja_extra.exceptions import ValidationError
++                raise ValidationError(
++                    f"Bulk patch accepts at most {max_items} items, got {len(data)}"
++                )
++            items = []
++            for item_schema in data:
++                item_data = item_schema.model_dump(exclude_unset=True)
++                pk = item_data.pop(lookup_param)
++                DynSchema = create_model(
++                    "DynPatchSchema",
++                    **{k: (t.Optional[t.Any], None) for k in item_data},
++                )
++                items.append({"pk": pk, "schema": DynSchema(**item_data)})
++            try:
++                results = await _check_if_coroutine(
++                    self.service.bulk_patch_async(
++                        items, atomic=atomic, lookup_field=lookup_param,
++                        check_permissions=self.check_object_permissions, **kwargs,
++                    )
++                )
++            except BulkOperationError as exc:
++                total_count = len(data)
++                results = [
++                    {"index": r["index"], "success": False, "status_code": 404,
++                     "data": None, "errors": "Rolled back"} for r in exc.results
++                ]
++                results.append(
++                    {"index": exc.failed_index, "success": False,
++                     "status_code": 404, "data": None, "errors": str(exc)}
++                )
++                for i in range(exc.failed_index + 1, total_count):
++                    results.append(
++                        {"index": i, "success": False, "status_code": 404,
++                         "data": None, "errors": "Skipped"}
++                    )
++            succeeded = sum(1 for r in results if r["success"])
++            return {
++                "total": len(results), "succeeded": succeeded,
++                "failed": len(results) - succeeded, "results": results,
++            }
++        bulk_patch_items.__name__ = cls._change_name("bulk_patch_items")
++        return bulk_patch_items
++
++    @classmethod
++    def _bulk_delete_handler(
++        cls, *, schema_in: t.Type[PydanticModel], lookup_param: str,
++        atomic: bool, max_items: int,
++    ) -> t.Callable:
++        async def bulk_delete_items(
++            self: "ModelControllerBase",
++            data: schema_in = Body(default=...),  # type:ignore[valid-type]
++            **kwargs: t.Any,
++        ) -> t.Any:
++            ids = data.ids
++            if len(ids) > max_items:
++                from ninja_extra.exceptions import ValidationError
++                raise ValidationError(
++                    f"Bulk delete accepts at most {max_items} items, got {len(ids)}"
++                )
++            try:
++                results = await _check_if_coroutine(
++                    self.service.bulk_delete_async(
++                        ids, atomic=atomic, lookup_field=lookup_param,
++                        check_permissions=self.check_object_permissions, **kwargs,
++                    )
++                )
++            except BulkOperationError as exc:
++                total_count = len(ids)
++                results = [
++                    {"index": r["index"], "success": False, "status_code": 404,
++                     "data": None, "errors": "Rolled back"} for r in exc.results
++                ]
++                results.append(
++                    {"index": exc.failed_index, "success": False,
++                     "status_code": 404, "data": None, "errors": str(exc)}
++                )
++                for i in range(exc.failed_index + 1, total_count):
++                    results.append(
++                        {"index": i, "success": False, "status_code": 404,
++                         "data": None, "errors": "Skipped"}
++                    )
++            succeeded = sum(1 for r in results if r["success"])
++            return {
++                "total": len(results), "succeeded": succeeded,
++                "failed": len(results) - succeeded, "results": results,
++            }
++        bulk_delete_items.__name__ = cls._change_name("bulk_delete_items")
++        return bulk_delete_items
+diff --git a/ninja_extra/controllers/model/schemas.py b/ninja_extra/controllers/model/schemas.py
+index 07bf9b2..7373468 100644
+--- a/ninja_extra/controllers/model/schemas.py
++++ b/ninja_extra/controllers/model/schemas.py
+@@ -27,9 +27,39 @@ except Exception:  # pragma: no cover
+     NINJA_SCHEMA_VERSION: t.Tuple[int, int, int] = (0, 0, 0)  # type: ignore[no-redef]
+ 
+ 
++from ninja import Schema
+ from ninja_extra.pagination import PageNumberPaginationExtra, PaginatedResponseSchema
+ 
+ 
++class BulkOperationError(Exception):
++    """Raised when an atomic bulk operation fails. Carries partial results and error info."""
++
++    def __init__(self, message: str, results: t.List[t.Dict[str, t.Any]], failed_index: int):
++        super().__init__(message)
++        self.results = results
++        self.failed_index = failed_index
++
++
++class BulkOperationConfig(PydanticModel):
++    atomic: bool = Field(default=True)
++    max_items: int = Field(default=100, ge=1)
++
++
++class BulkItemResult(Schema):
++    index: int
++    success: bool
++    status_code: int
++    data: t.Optional[t.Any] = None
++    errors: t.Optional[t.Any] = None
++
++
++class BulkOperationResponse(Schema):
++    total: int
++    succeeded: int
++    failed: int
++    results: t.List[BulkItemResult]
++
++
+ def _is_ninja_schema_version_supported() -> bool:
+     if NINJA_SCHEMA_VERSION[1] >= 14 and NINJA_SCHEMA_VERSION[2] >= 1:
+         return True
+@@ -100,6 +130,8 @@ class ModelConfig(PydanticModel):
+ 
+     schema_config: ModelSchemaConfig = Field(default=ModelSchemaConfig(exclude=set()))
+ 
++    bulk_config: t.Optional[BulkOperationConfig] = None
++
+     create_route_info: t.Dict = {}  # extra @post() information
+     find_one_route_info: t.Dict = {}  # extra @get('/{id}') information
+     update_route_info: t.Dict = {}  # extra @put() information
+@@ -107,9 +139,17 @@ class ModelConfig(PydanticModel):
+     list_route_info: t.Dict = {}  # extra @get('/') information
+     delete_route_info: t.Dict = {}  # extra @delete() information
+ 
++    bulk_create_route_info: t.Dict = {}
++    bulk_update_route_info: t.Dict = {}
++    bulk_patch_route_info: t.Dict = {}
++    bulk_delete_route_info: t.Dict = {}
++
+     @field_validator("allowed_routes", mode="before")
+     def validate_allow_routes(cls, value: t.List[t.Any]) -> t.Any:
+-        defaults = ["create", "find_one", "update", "patch", "delete", "list"]
++        defaults = [
++            "create", "find_one", "update", "patch", "delete", "list",
++            "bulk_create", "bulk_update", "bulk_patch", "bulk_delete",
++        ]
+         for item in value:
+             if item not in defaults:
+                 raise ValueError(f"'{item}' action is not recognized in [{defaults}]")
+diff --git a/ninja_extra/controllers/model/service.py b/ninja_extra/controllers/model/service.py
+index 9e3216a..c1a0b02 100644
+--- a/ninja_extra/controllers/model/service.py
++++ b/ninja_extra/controllers/model/service.py
+@@ -2,13 +2,15 @@ import traceback
+ import typing as t
+ 
+ from asgiref.sync import sync_to_async
++from django.db import transaction
+ from django.db.models import Model, QuerySet
+ from pydantic import BaseModel as PydanticModel
+ 
+-from ninja_extra.exceptions import NotFound
++from ninja_extra.exceptions import APIException, NotFound
+ from ninja_extra.shortcuts import get_object_or_exception
+ 
+ from .interfaces import AsyncModelServiceBase, ModelServiceBase
++from .schemas import BulkOperationError
+ 
+ 
+ class ModelService(ModelServiceBase, AsyncModelServiceBase):
+@@ -94,3 +96,287 @@ class ModelService(ModelServiceBase, AsyncModelServiceBase):
+ 
+     async def delete_async(self, instance: Model, **kwargs: t.Any) -> t.Any:
+         return await sync_to_async(self.delete, thread_sensitive=True)(instance)
++
++    def _model_to_dict(self, instance: Model) -> t.Dict[str, t.Any]:
++        from django.forms.models import model_to_dict
++        return model_to_dict(instance)
++
++    # ── Bulk create ─────────────────────────────────────────
++
++    def _do_bulk_create_atomic(
++        self, schemas: t.List[PydanticModel], **kwargs: t.Any
++    ) -> t.List[t.Dict[str, t.Any]]:
++        results: t.List[t.Dict[str, t.Any]] = []
++        with transaction.atomic():
++            for idx, schema in enumerate(schemas):
++                try:
++                    instance = self.create(schema, **kwargs)
++                    results.append(
++                        {"index": idx, "success": True, "status_code": 201,
++                         "data": self._model_to_dict(instance), "errors": None}
++                    )
++                except Exception as e:
++                    raise BulkOperationError(
++                        f"Bulk create failed at index {idx}: {e}",
++                        results=results, failed_index=idx,
++                    ) from e
++        return results
++
++    def _do_bulk_create_non_atomic(
++        self, schemas: t.List[PydanticModel], **kwargs: t.Any
++    ) -> t.List[t.Dict[str, t.Any]]:
++        results: t.List[t.Dict[str, t.Any]] = []
++        for idx, schema in enumerate(schemas):
++            try:
++                instance = self.create(schema, **kwargs)
++                results.append(
++                    {"index": idx, "success": True, "status_code": 201,
++                     "data": self._model_to_dict(instance), "errors": None}
++                )
++            except Exception as e:
++                results.append(
++                    {"index": idx, "success": False, "status_code": 400,
++                     "data": None, "errors": str(e)}
++                )
++        return results
++
++    def bulk_create(
++        self, schemas: t.List[PydanticModel], *, atomic: bool = True, **kwargs: t.Any,
++    ) -> t.List[t.Dict[str, t.Any]]:
++        if atomic:
++            return self._do_bulk_create_atomic(schemas, **kwargs)
++        return self._do_bulk_create_non_atomic(schemas, **kwargs)
++
++    async def bulk_create_async(
++        self, schemas: t.List[PydanticModel], *, atomic: bool = True, **kwargs: t.Any,
++    ) -> t.List[t.Dict[str, t.Any]]:
++        return await sync_to_async(self.bulk_create, thread_sensitive=True)(
++            schemas, atomic=atomic, **kwargs
++        )
++
++    # ── Bulk update ─────────────────────────────────────────
++
++    def _do_bulk_update_atomic(
++        self, items: t.List[t.Dict[str, t.Any]], lookup_field: str = "pk",
++        check_permissions: t.Optional[t.Callable] = None, **kwargs: t.Any,
++    ) -> t.List[t.Dict[str, t.Any]]:
++        results: t.List[t.Dict[str, t.Any]] = []
++        with transaction.atomic():
++            for idx, item in enumerate(items):
++                try:
++                    pk = item["pk"]
++                    schema = item["schema"]
++                    instance = get_object_or_exception(
++                        klass=self.model, error_message=None, exception=NotFound,
++                        **{lookup_field: pk},
++                    )
++                    if check_permissions:
++                        check_permissions(instance)
++                    updated = self.update(instance=instance, schema=schema, **kwargs)
++                    results.append(
++                        {"index": idx, "success": True, "status_code": 200,
++                         "data": self._model_to_dict(updated), "errors": None}
++                    )
++                except Exception as e:
++                    raise BulkOperationError(
++                        f"Bulk update failed at index {idx}: {e}",
++                        results=results, failed_index=idx,
++                    ) from e
++        return results
++
++    def _do_bulk_update_non_atomic(
++        self, items: t.List[t.Dict[str, t.Any]], lookup_field: str = "pk",
++        check_permissions: t.Optional[t.Callable] = None, **kwargs: t.Any,
++    ) -> t.List[t.Dict[str, t.Any]]:
++        results: t.List[t.Dict[str, t.Any]] = []
++        for idx, item in enumerate(items):
++            try:
++                pk = item["pk"]
++                schema = item["schema"]
++                instance = get_object_or_exception(
++                    klass=self.model, error_message=None, exception=NotFound,
++                    **{lookup_field: pk},
++                )
++                if check_permissions:
++                    check_permissions(instance)
++                updated = self.update(instance=instance, schema=schema, **kwargs)
++                results.append(
++                    {"index": idx, "success": True, "status_code": 200,
++                     "data": self._model_to_dict(updated), "errors": None}
++                )
++            except Exception as e:
++                sc = getattr(e, "status_code", 500) if isinstance(e, APIException) else 500
++                results.append(
++                    {"index": idx, "success": False, "status_code": sc,
++                     "data": None, "errors": str(e)}
++                )
++        return results
++
++    def bulk_update(
++        self, items: t.List[t.Dict[str, t.Any]], *,
++        atomic: bool = True, lookup_field: str = "pk",
++        check_permissions: t.Optional[t.Callable] = None, **kwargs: t.Any,
++    ) -> t.List[t.Dict[str, t.Any]]:
++        if atomic:
++            return self._do_bulk_update_atomic(items, lookup_field=lookup_field, check_permissions=check_permissions, **kwargs)
++        return self._do_bulk_update_non_atomic(items, lookup_field=lookup_field, check_permissions=check_permissions, **kwargs)
++
++    async def bulk_update_async(
++        self, items: t.List[t.Dict[str, t.Any]], *,
++        atomic: bool = True, lookup_field: str = "pk",
++        check_permissions: t.Optional[t.Callable] = None, **kwargs: t.Any,
++    ) -> t.List[t.Dict[str, t.Any]]:
++        return await sync_to_async(self.bulk_update, thread_sensitive=True)(
++            items, atomic=atomic, lookup_field=lookup_field,
++            check_permissions=check_permissions, **kwargs
++        )
++
++    # ── Bulk patch ──────────────────────────────────────────
++
++    def _do_bulk_patch_atomic(
++        self, items: t.List[t.Dict[str, t.Any]], lookup_field: str = "pk",
++        check_permissions: t.Optional[t.Callable] = None, **kwargs: t.Any,
++    ) -> t.List[t.Dict[str, t.Any]]:
++        results: t.List[t.Dict[str, t.Any]] = []
++        with transaction.atomic():
++            for idx, item in enumerate(items):
++                try:
++                    pk = item["pk"]
++                    schema = item["schema"]
++                    instance = get_object_or_exception(
++                        klass=self.model, error_message=None, exception=NotFound,
++                        **{lookup_field: pk},
++                    )
++                    if check_permissions:
++                        check_permissions(instance)
++                    patched = self.patch(instance=instance, schema=schema, **kwargs)
++                    results.append(
++                        {"index": idx, "success": True, "status_code": 200,
++                         "data": self._model_to_dict(patched), "errors": None}
++                    )
++                except Exception as e:
++                    raise BulkOperationError(
++                        f"Bulk patch failed at index {idx}: {e}",
++                        results=results, failed_index=idx,
++                    ) from e
++        return results
++
++    def _do_bulk_patch_non_atomic(
++        self, items: t.List[t.Dict[str, t.Any]], lookup_field: str = "pk",
++        check_permissions: t.Optional[t.Callable] = None, **kwargs: t.Any,
++    ) -> t.List[t.Dict[str, t.Any]]:
++        results: t.List[t.Dict[str, t.Any]] = []
++        for idx, item in enumerate(items):
++            try:
++                pk = item["pk"]
++                schema = item["schema"]
++                instance = get_object_or_exception(
++                    klass=self.model, error_message=None, exception=NotFound,
++                    **{lookup_field: pk},
++                )
++                if check_permissions:
++                    check_permissions(instance)
++                patched = self.patch(instance=instance, schema=schema, **kwargs)
++                results.append(
++                    {"index": idx, "success": True, "status_code": 200,
++                     "data": self._model_to_dict(patched), "errors": None}
++                )
++            except Exception as e:
++                sc = getattr(e, "status_code", 500) if isinstance(e, APIException) else 500
++                results.append(
++                    {"index": idx, "success": False, "status_code": sc,
++                     "data": None, "errors": str(e)}
++                )
++        return results
++
++    def bulk_patch(
++        self, items: t.List[t.Dict[str, t.Any]], *,
++        atomic: bool = True, lookup_field: str = "pk",
++        check_permissions: t.Optional[t.Callable] = None, **kwargs: t.Any,
++    ) -> t.List[t.Dict[str, t.Any]]:
++        if atomic:
++            return self._do_bulk_patch_atomic(items, lookup_field=lookup_field, check_permissions=check_permissions, **kwargs)
++        return self._do_bulk_patch_non_atomic(items, lookup_field=lookup_field, check_permissions=check_permissions, **kwargs)
++
++    async def bulk_patch_async(
++        self, items: t.List[t.Dict[str, t.Any]], *,
++        atomic: bool = True, lookup_field: str = "pk",
++        check_permissions: t.Optional[t.Callable] = None, **kwargs: t.Any,
++    ) -> t.List[t.Dict[str, t.Any]]:
++        return await sync_to_async(self.bulk_patch, thread_sensitive=True)(
++            items, atomic=atomic, lookup_field=lookup_field,
++            check_permissions=check_permissions, **kwargs
++        )
++
++    # ── Bulk delete ─────────────────────────────────────────
++
++    def _do_bulk_delete_atomic(
++        self, pks: t.List[t.Any], lookup_field: str = "pk",
++        check_permissions: t.Optional[t.Callable] = None, **kwargs: t.Any,
++    ) -> t.List[t.Dict[str, t.Any]]:
++        results: t.List[t.Dict[str, t.Any]] = []
++        with transaction.atomic():
++            for idx, pk in enumerate(pks):
++                try:
++                    instance = get_object_or_exception(
++                        klass=self.model, error_message=None, exception=NotFound,
++                        **{lookup_field: pk},
++                    )
++                    if check_permissions:
++                        check_permissions(instance)
++                    self.delete(instance=instance, **kwargs)
++                    results.append(
++                        {"index": idx, "success": True, "status_code": 204,
++                         "data": None, "errors": None}
++                    )
++                except Exception as e:
++                    raise BulkOperationError(
++                        f"Bulk delete failed at index {idx}: {e}",
++                        results=results, failed_index=idx,
++                    ) from e
++        return results
++
++    def _do_bulk_delete_non_atomic(
++        self, pks: t.List[t.Any], lookup_field: str = "pk",
++        check_permissions: t.Optional[t.Callable] = None, **kwargs: t.Any,
++    ) -> t.List[t.Dict[str, t.Any]]:
++        results: t.List[t.Dict[str, t.Any]] = []
++        for idx, pk in enumerate(pks):
++            try:
++                instance = get_object_or_exception(
++                    klass=self.model, error_message=None, exception=NotFound,
++                    **{lookup_field: pk},
++                )
++                if check_permissions:
++                    check_permissions(instance)
++                self.delete(instance=instance, **kwargs)
++                results.append(
++                    {"index": idx, "success": True, "status_code": 204,
++                     "data": None, "errors": None}
++                )
++            except Exception as e:
++                sc = getattr(e, "status_code", 500) if isinstance(e, APIException) else 500
++                results.append(
++                    {"index": idx, "success": False, "status_code": sc,
++                     "data": None, "errors": str(e)}
++                )
++        return results
++
++    def bulk_delete(
++        self, pks: t.List[t.Any], *,
++        atomic: bool = True, lookup_field: str = "pk",
++        check_permissions: t.Optional[t.Callable] = None, **kwargs: t.Any,
++    ) -> t.List[t.Dict[str, t.Any]]:
++        if atomic:
++            return self._do_bulk_delete_atomic(pks, lookup_field=lookup_field, check_permissions=check_permissions, **kwargs)
++        return self._do_bulk_delete_non_atomic(pks, lookup_field=lookup_field, check_permissions=check_permissions, **kwargs)
++
++    async def bulk_delete_async(
++        self, pks: t.List[t.Any], *,
++        atomic: bool = True, lookup_field: str = "pk",
++        check_permissions: t.Optional[t.Callable] = None, **kwargs: t.Any,
++    ) -> t.List[t.Dict[str, t.Any]]:
++        return await sync_to_async(self.bulk_delete, thread_sensitive=True)(
++            pks, atomic=atomic, lookup_field=lookup_field,
++            check_permissions=check_permissions, **kwargs
++        )

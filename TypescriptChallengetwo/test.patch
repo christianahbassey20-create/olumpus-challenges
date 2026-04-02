@@ -1,0 +1,1355 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..ce2cb7c
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,13 @@
++#!/bin/bash
++set -e
++
++cd /app
++
++if [ "$1" = "base" ]; then
++    python -m pytest tests/ --ignore=tests/test_throthling/test_advanced_throttling.py -x -q
++elif [ "$1" = "new" ]; then
++    python -m pytest tests/test_throthling/test_advanced_throttling.py -x -q
++else
++    echo "Usage: bash test.sh [base|new]"
++    exit 1
++fi
+diff --git a/tests/test_throthling/test_advanced_throttling.py b/tests/test_throthling/test_advanced_throttling.py
+new file mode 100644
+index 0000000..61684fb
+--- /dev/null
++++ b/tests/test_throthling/test_advanced_throttling.py
+@@ -0,0 +1,1330 @@
++import math
++import uuid
++from contextlib import contextmanager
++
++import django
++import pytest
++from django.core.cache import cache
++from django.dispatch import Signal
++from django.http import HttpRequest
++from ninja.errors import HttpError
++from ninja.testing import TestAsyncClient, TestClient
++
++from ninja_extra import NinjaExtraAPI
++from ninja_extra.conf import settings
++from ninja_extra.exceptions import Throttled
++from ninja_extra.throttling import (
++    SimpleRateThrottle,
++    UserRateThrottle,
++)
++
++
++class MockUser(str):
++    is_authenticated = True
++    pk = id = 23
++
++    def set_id(self, value):
++        self.pk = self.id = value
++
++
++# ──────────────────────────────────────────────
++# TokenBucketThrottle Tests
++# ──────────────────────────────────────────────
++
++
++class TestTokenBucketImportAndSubclass:
++    def test_token_bucket_importable_from_throttling(self):
++        from ninja_extra.throttling import TokenBucketThrottle
++
++        assert TokenBucketThrottle is not None
++
++    def test_token_bucket_is_subclass_of_simple_rate_throttle(self):
++        from ninja_extra.throttling import TokenBucketThrottle
++
++        assert issubclass(TokenBucketThrottle, SimpleRateThrottle)
++
++    def test_token_bucket_accepts_rate_string(self):
++        from ninja_extra.throttling import TokenBucketThrottle
++
++        class MyBucket(TokenBucketThrottle):
++            scope = "test_bucket"
++
++            def get_cache_key(self, request):
++                return "test_key_rate_string"
++
++        throttle = MyBucket(rate="10/min")
++        request = HttpRequest()
++        request.META["REMOTE_ADDR"] = "1.0.0.1"
++        # 10 requests should be allowed, 11th denied
++        for _ in range(10):
++            assert throttle.allow_request(request) is True
++        assert throttle.allow_request(request) is False
++
++
++class TestTokenBucketBasicBehavior:
++    def setup_method(self):
++        cache.clear()
++
++        from ninja_extra.throttling import TokenBucketThrottle
++
++        class BucketThrottle(TokenBucketThrottle):
++            scope = "test_bucket_basic"
++            cache_format = "token_bucket_%(scope)s_%(ident)s"
++
++            def get_cache_key(self, request):
++                ident = self.get_ident(request) or "test"
++                return self.cache_format % {"scope": self.scope, "ident": ident}
++
++        self.throttle_class = BucketThrottle
++
++    def test_allows_requests_up_to_capacity(self):
++        throttle = self.throttle_class(rate="5/min")
++        request = HttpRequest()
++        request.META["REMOTE_ADDR"] = "1.1.1.1"
++
++        for _ in range(5):
++            assert throttle.allow_request(request) is True
++
++    def test_denies_request_after_capacity_exhausted(self):
++        throttle = self.throttle_class(rate="5/min")
++        request = HttpRequest()
++        request.META["REMOTE_ADDR"] = "2.2.2.2"
++
++        for _ in range(5):
++            throttle.allow_request(request)
++        assert throttle.allow_request(request) is False
++
++    def test_allows_burst_at_full_capacity(self):
++        throttle = self.throttle_class(rate="10/sec")
++        request = HttpRequest()
++        request.META["REMOTE_ADDR"] = "3.3.3.3"
++
++        results = []
++        for _ in range(10):
++            results.append(throttle.allow_request(request))
++        assert all(results), "All requests within capacity should be allowed"
++        assert throttle.allow_request(request) is False
++
++    def test_different_clients_have_separate_buckets(self):
++        request_a = HttpRequest()
++        request_a.META["REMOTE_ADDR"] = "10.0.0.1"
++        request_b = HttpRequest()
++        request_b.META["REMOTE_ADDR"] = "10.0.0.2"
++
++        throttle = self.throttle_class(rate="3/min")
++
++        for _ in range(3):
++            throttle.allow_request(request_a)
++        assert throttle.allow_request(request_a) is False
++
++        assert throttle.allow_request(request_b) is True
++
++    def test_token_refill_after_time_passes(self):
++        from ninja_extra.throttling import TokenBucketThrottle
++
++        timer_value = [0.0]
++
++        class TimedBucket(TokenBucketThrottle):
++            scope = "test_refill"
++            cache_format = "token_bucket_%(scope)s_%(ident)s"
++
++            def timer(self):
++                return timer_value[0]
++
++            def get_cache_key(self, request):
++                return "token_bucket_test_refill_timed"
++
++        throttle = TimedBucket(rate="5/min")
++        request = HttpRequest()
++        request.META["REMOTE_ADDR"] = "4.4.4.4"
++
++        timer_value[0] = 0.0
++        for _ in range(5):
++            throttle.allow_request(request)
++        assert throttle.allow_request(request) is False
++
++        timer_value[0] = 12.0
++        assert throttle.allow_request(request) is True
++
++    def test_partial_token_refill(self):
++        from ninja_extra.throttling import TokenBucketThrottle
++
++        timer_value = [0.0]
++
++        class TimedBucket(TokenBucketThrottle):
++            scope = "test_partial"
++            cache_format = "token_bucket_%(scope)s_%(ident)s"
++
++            def timer(self):
++                return timer_value[0]
++
++            def get_cache_key(self, request):
++                return "token_bucket_test_partial_refill"
++
++        throttle = TimedBucket(rate="10/min")
++        request = HttpRequest()
++        request.META["REMOTE_ADDR"] = "5.5.5.5"
++
++        timer_value[0] = 0.0
++        for _ in range(10):
++            throttle.allow_request(request)
++        assert throttle.allow_request(request) is False
++
++        timer_value[0] = 3.0
++        assert throttle.allow_request(request) is False
++
++        timer_value[0] = 6.0
++        assert throttle.allow_request(request) is True
++
++    def test_tokens_capped_at_capacity(self):
++        from ninja_extra.throttling import TokenBucketThrottle
++
++        timer_value = [0.0]
++
++        class TimedBucket(TokenBucketThrottle):
++            scope = "test_cap"
++            cache_format = "token_bucket_%(scope)s_%(ident)s"
++
++            def timer(self):
++                return timer_value[0]
++
++            def get_cache_key(self, request):
++                return "token_bucket_test_cap_cap"
++
++        throttle = TimedBucket(rate="3/sec")
++        request = HttpRequest()
++        request.META["REMOTE_ADDR"] = "6.6.6.6"
++
++        timer_value[0] = 0.0
++        for _ in range(3):
++            throttle.allow_request(request)
++        assert throttle.allow_request(request) is False
++
++        timer_value[0] = 1000.0
++        results = []
++        for _ in range(3):
++            results.append(throttle.allow_request(request))
++        assert all(results)
++        assert throttle.allow_request(request) is False
++
++
++class TestTokenBucketWait:
++    def setup_method(self):
++        cache.clear()
++
++    def test_wait_returns_seconds_until_next_token(self):
++        from ninja_extra.throttling import TokenBucketThrottle
++
++        timer_value = [0.0]
++
++        class TimedBucket(TokenBucketThrottle):
++            scope = "test_wait"
++            cache_format = "token_bucket_%(scope)s_%(ident)s"
++
++            def timer(self):
++                return timer_value[0]
++
++            def get_cache_key(self, request):
++                return "token_bucket_test_wait_val"
++
++        throttle = TimedBucket(rate="10/min")
++        request = HttpRequest()
++        request.META["REMOTE_ADDR"] = "7.7.7.7"
++
++        timer_value[0] = 0.0
++        for _ in range(10):
++            throttle.allow_request(request)
++        throttle.allow_request(request)
++
++        wait_time = throttle.wait()
++        assert wait_time is not None
++        assert abs(wait_time - 6.0) < 0.5
++
++    def test_wait_returns_none_when_rate_is_none(self):
++        from ninja_extra.throttling import TokenBucketThrottle
++
++        class NullBucket(TokenBucketThrottle):
++            scope = "test_null_wait"
++
++            def get_cache_key(self, request):
++                return "test"
++
++        throttle = NullBucket(rate=None)
++        assert throttle.wait() is None
++
++    def test_allow_request_always_permits_when_rate_is_none(self):
++        from ninja_extra.throttling import TokenBucketThrottle
++
++        class UnlimitedBucket(TokenBucketThrottle):
++            scope = "test_unlimited"
++
++            def get_cache_key(self, request):
++                return "test_unlimited_key"
++
++        throttle = UnlimitedBucket(rate=None)
++        request = HttpRequest()
++        request.META["REMOTE_ADDR"] = "7.7.7.8"
++        for _ in range(20):
++            assert throttle.allow_request(request) is True
++
++    def test_wait_correct_for_different_periods(self):
++        from ninja_extra.throttling import TokenBucketThrottle
++
++        timer_value = [0.0]
++
++        class HourBucket(TokenBucketThrottle):
++            scope = "test_hour_wait"
++            cache_format = "token_bucket_%(scope)s_%(ident)s"
++
++            def timer(self):
++                return timer_value[0]
++
++            def get_cache_key(self, request):
++                return "token_bucket_test_hour_wait"
++
++        throttle = HourBucket(rate="3600/hour")
++        request = HttpRequest()
++        request.META["REMOTE_ADDR"] = "8.8.8.8"
++
++        timer_value[0] = 0.0
++        for _ in range(3600):
++            throttle.allow_request(request)
++        throttle.allow_request(request)
++
++        wait_time = throttle.wait()
++        assert wait_time is not None
++        assert abs(wait_time - 1.0) < 0.5
++
++
++class TestTokenBucketScopeLookup:
++    def setup_method(self):
++        cache.clear()
++
++    def test_scope_based_rate_lookup(self, monkeypatch):
++        from ninja_extra.throttling import TokenBucketThrottle
++
++        with monkeypatch.context() as m:
++            m.setattr(
++                settings, "THROTTLE_RATES",
++                {"bucket_scope": "5/min", "user": None, "anon": None},
++            )
++
++            class ScopedBucket(TokenBucketThrottle):
++                scope = "bucket_scope"
++
++                def get_cache_key(self, request):
++                    return "token_bucket_bucket_scope_scoped"
++
++            throttle = ScopedBucket()
++
++            request = HttpRequest()
++            request.META["REMOTE_ADDR"] = "9.9.9.9"
++            for _ in range(5):
++                assert throttle.allow_request(request) is True
++            assert throttle.allow_request(request) is False
++
++    def test_cache_key_is_stable_and_scope_isolated(self):
++        """Cache keys are not None, stable across calls, and different scopes produce different keys."""
++        from ninja_extra.throttling import TokenBucketThrottle
++
++        class ScopeA(TokenBucketThrottle):
++            scope = "scope_a"
++            def get_cache_key(self, request):
++                ident = self.get_ident(request) or "anon"
++                return self.cache_format % {"scope": self.scope, "ident": ident}
++
++        class ScopeB(TokenBucketThrottle):
++            scope = "scope_b"
++            def get_cache_key(self, request):
++                ident = self.get_ident(request) or "anon"
++                return self.cache_format % {"scope": self.scope, "ident": ident}
++
++        request = HttpRequest()
++        request.META["REMOTE_ADDR"] = "11.11.11.11"
++        key_a = ScopeA(rate="5/min").get_cache_key(request)
++        key_b = ScopeB(rate="5/min").get_cache_key(request)
++        assert key_a is not None
++        assert key_b is not None
++        assert key_a != key_b
++        # Same scope produces same key
++        assert ScopeA(rate="5/min").get_cache_key(request) == key_a
++
++    def test_convenience_subclass_keys_derived_from_scope_and_ident(self):
++        """UserTokenBucketThrottle keys vary by user; AnonTokenBucketThrottle keys vary by IP."""
++        from ninja_extra.throttling import AnonTokenBucketThrottle, UserTokenBucketThrottle
++
++        user_throttle = UserTokenBucketThrottle(rate="5/min")
++        req = HttpRequest()
++        user = MockUser("ScopeIdentUser")
++        user.set_id(501)
++        req.user = user
++        req.META["REMOTE_ADDR"] = "11.11.11.12"
++        user_key = user_throttle.get_cache_key(req)
++        assert user_key is not None
++
++        anon_throttle = AnonTokenBucketThrottle(rate="5/min")
++        anon_req = HttpRequest()
++        anon_req.user = None
++        anon_req.META["REMOTE_ADDR"] = "11.11.11.13"
++        anon_key = anon_throttle.get_cache_key(anon_req)
++        assert anon_key is not None
++
++        # Different throttle types / different idents produce different keys
++        assert user_key != anon_key
++
++
++# ──────────────────────────────────────────────
++# UserTokenBucketThrottle and AnonTokenBucketThrottle Tests
++# ──────────────────────────────────────────────
++
++
++class TestUserTokenBucketThrottle:
++    def setup_method(self):
++        cache.clear()
++
++    def test_importable(self):
++        from ninja_extra.throttling import UserTokenBucketThrottle
++
++        assert UserTokenBucketThrottle is not None
++
++    def test_authenticated_users_get_distinct_keys(self):
++        from ninja_extra.throttling import UserTokenBucketThrottle
++
++        throttle = UserTokenBucketThrottle(rate="5/min")
++
++        req_a = HttpRequest()
++        user_a = MockUser("BucketUserA")
++        user_a.set_id(42)
++        req_a.user = user_a
++
++        req_b = HttpRequest()
++        user_b = MockUser("BucketUserB")
++        user_b.set_id(99)
++        req_b.user = user_b
++
++        key_a = throttle.get_cache_key(req_a)
++        key_b = throttle.get_cache_key(req_b)
++        assert key_a is not None
++        assert key_b is not None
++        assert key_a != key_b
++
++    def test_anonymous_users_get_key_from_ip(self):
++        from ninja_extra.throttling import UserTokenBucketThrottle
++
++        throttle = UserTokenBucketThrottle(rate="5/min")
++
++        req_a = HttpRequest()
++        req_a.user = None
++        req_a.META["REMOTE_ADDR"] = "192.168.1.1"
++
++        req_b = HttpRequest()
++        req_b.user = None
++        req_b.META["REMOTE_ADDR"] = "192.168.1.2"
++
++        key_a = throttle.get_cache_key(req_a)
++        key_b = throttle.get_cache_key(req_b)
++        assert key_a is not None
++        assert key_b is not None
++        assert key_a != key_b
++
++    def test_throttles_per_user(self):
++        from ninja_extra.throttling import UserTokenBucketThrottle
++
++        throttle = UserTokenBucketThrottle(rate="2/min")
++
++        user_a = MockUser("UserA")
++        user_a.set_id(uuid.uuid4())
++        request_a = HttpRequest()
++        request_a.user = user_a
++        request_a.META["REMOTE_ADDR"] = "1.1.1.1"
++
++        user_b = MockUser("UserB")
++        user_b.set_id(uuid.uuid4())
++        request_b = HttpRequest()
++        request_b.user = user_b
++        request_b.META["REMOTE_ADDR"] = "1.1.1.1"
++
++        throttle.allow_request(request_a)
++        throttle.allow_request(request_a)
++        assert throttle.allow_request(request_a) is False
++
++        assert throttle.allow_request(request_b) is True
++
++
++class TestAnonTokenBucketThrottle:
++    def setup_method(self):
++        cache.clear()
++
++    def test_importable(self):
++        from ninja_extra.throttling import AnonTokenBucketThrottle
++
++        assert AnonTokenBucketThrottle is not None
++
++    def test_returns_none_for_authenticated(self):
++        from ninja_extra.throttling import AnonTokenBucketThrottle
++
++        throttle = AnonTokenBucketThrottle(rate="5/min")
++        request = HttpRequest()
++        user = MockUser("AuthUser")
++        user.set_id(99)
++        request.user = user
++        assert throttle.get_cache_key(request) is None
++
++    def test_anonymous_users_get_distinct_keys(self):
++        from ninja_extra.throttling import AnonTokenBucketThrottle
++
++        throttle = AnonTokenBucketThrottle(rate="5/min")
++
++        req_a = HttpRequest()
++        req_a.user = None
++        req_a.META["REMOTE_ADDR"] = "10.20.30.40"
++
++        req_b = HttpRequest()
++        req_b.user = None
++        req_b.META["REMOTE_ADDR"] = "10.20.30.41"
++
++        key_a = throttle.get_cache_key(req_a)
++        key_b = throttle.get_cache_key(req_b)
++        assert key_a is not None
++        assert key_b is not None
++        assert key_a != key_b
++
++    def test_throttles_anonymous_only(self):
++        from ninja_extra.throttling import AnonTokenBucketThrottle
++
++        throttle = AnonTokenBucketThrottle(rate="2/min")
++
++        anon_request = HttpRequest()
++        anon_request.user = None
++        anon_request.META["REMOTE_ADDR"] = "50.50.50.50"
++
++        throttle.allow_request(anon_request)
++        throttle.allow_request(anon_request)
++        assert throttle.allow_request(anon_request) is False
++
++        auth_request = HttpRequest()
++        auth_user = MockUser("AuthSkip")
++        auth_user.set_id(uuid.uuid4())
++        auth_request.user = auth_user
++        assert throttle.allow_request(auth_request) is True
++
++
++# ──────────────────────────────────────────────
++# ConcurrentRateThrottle Tests
++# ──────────────────────────────────────────────
++
++
++class TestConcurrentImportAndSubclass:
++    def test_concurrent_importable_from_throttling(self):
++        from ninja_extra.throttling import ConcurrentRateThrottle
++
++        assert ConcurrentRateThrottle is not None
++
++    def test_concurrent_supports_get_ident(self):
++        from ninja_extra.throttling import ConcurrentRateThrottle
++
++        throttle = ConcurrentRateThrottle()
++        assert hasattr(throttle, "get_ident"), "ConcurrentRateThrottle must support get_ident"
++        request = HttpRequest()
++        request.META["REMOTE_ADDR"] = "99.99.99.99"
++        ident = throttle.get_ident(request)
++        assert ident is not None
++
++    def test_concurrent_default_max_concurrent_is_one(self):
++        from ninja_extra.throttling import ConcurrentRateThrottle
++
++        throttle = ConcurrentRateThrottle()
++        assert throttle.max_concurrent == 1
++
++    def test_concurrent_accepts_max_concurrent_param(self):
++        from ninja_extra.throttling import ConcurrentRateThrottle
++
++        throttle = ConcurrentRateThrottle(max_concurrent=5)
++        assert throttle.max_concurrent == 5
++
++    def test_concurrent_default_scope(self):
++        from ninja_extra.throttling import ConcurrentRateThrottle
++
++        throttle = ConcurrentRateThrottle()
++        assert throttle.scope == "concurrent"
++
++    def test_concurrent_default_slot_ttl_is_thirty(self):
++        from ninja_extra.throttling import ConcurrentRateThrottle
++
++        throttle = ConcurrentRateThrottle()
++        assert throttle.slot_ttl == 30
++
++    def test_concurrent_custom_slot_ttl(self):
++        from ninja_extra.throttling import ConcurrentRateThrottle
++
++        throttle = ConcurrentRateThrottle(max_concurrent=2, slot_ttl=60)
++        assert throttle.slot_ttl == 60
++
++    def test_concurrent_base_uses_user_pk_for_authenticated(self):
++        from ninja_extra.throttling import ConcurrentRateThrottle
++
++        throttle = ConcurrentRateThrottle(max_concurrent=2)
++        req_a = HttpRequest()
++        user_a = MockUser("BaseAuth1")
++        user_a.set_id(111)
++        req_a.user = user_a
++
++        req_b = HttpRequest()
++        user_b = MockUser("BaseAuth2")
++        user_b.set_id(222)
++        req_b.user = user_b
++
++        key_a = throttle.get_cache_key(req_a)
++        key_b = throttle.get_cache_key(req_b)
++        assert key_a is not None
++        assert key_b is not None
++        assert key_a != key_b
++
++
++class TestConcurrentBasicBehavior:
++    def setup_method(self):
++        cache.clear()
++
++    def test_allows_up_to_max_concurrent(self):
++        from ninja_extra.throttling import ConcurrentRateThrottle
++
++        throttle = ConcurrentRateThrottle(max_concurrent=3)
++        request = HttpRequest()
++        request.META["REMOTE_ADDR"] = "20.0.0.1"
++
++        for _ in range(3):
++            assert throttle.allow_request(request) is True
++        assert throttle.allow_request(request) is False
++
++    def test_release_allows_new_request(self):
++        from ninja_extra.throttling import ConcurrentRateThrottle
++
++        throttle = ConcurrentRateThrottle(max_concurrent=1)
++        request = HttpRequest()
++        request.META["REMOTE_ADDR"] = "20.0.0.2"
++
++        assert throttle.allow_request(request) is True
++        assert throttle.allow_request(request) is False
++
++        throttle.finish_request(request)
++        assert throttle.allow_request(request) is True
++
++    def test_different_clients_independent(self):
++        from ninja_extra.throttling import ConcurrentRateThrottle
++
++        throttle = ConcurrentRateThrottle(max_concurrent=1)
++        request_a = HttpRequest()
++        request_a.META["REMOTE_ADDR"] = "20.0.0.3"
++        request_b = HttpRequest()
++        request_b.META["REMOTE_ADDR"] = "20.0.0.4"
++
++        assert throttle.allow_request(request_a) is True
++        assert throttle.allow_request(request_a) is False
++
++        assert throttle.allow_request(request_b) is True
++
++    def test_concurrent_cache_key_is_stable_and_not_none(self):
++        """Cache key is not None and stable for the same client."""
++        from ninja_extra.throttling import ConcurrentRateThrottle
++
++        throttle = ConcurrentRateThrottle(max_concurrent=2)
++        request = HttpRequest()
++        request.META["REMOTE_ADDR"] = "20.0.0.5"
++        key = throttle.get_cache_key(request)
++        assert key is not None
++        assert throttle.get_cache_key(request) == key
++
++    def test_finish_request_multiple_releases(self):
++        from ninja_extra.throttling import ConcurrentRateThrottle
++
++        throttle = ConcurrentRateThrottle(max_concurrent=2)
++        request = HttpRequest()
++        request.META["REMOTE_ADDR"] = "20.0.0.6"
++
++        assert throttle.allow_request(request) is True
++        assert throttle.allow_request(request) is True
++        assert throttle.allow_request(request) is False
++
++        throttle.finish_request(request)
++        assert throttle.allow_request(request) is True
++        assert throttle.allow_request(request) is False
++
++        throttle.finish_request(request)
++        throttle.finish_request(request)
++        assert throttle.allow_request(request) is True
++
++    def test_stale_slots_expire(self):
++        from ninja_extra.throttling import ConcurrentRateThrottle
++
++        timer_value = [0.0]
++
++        class TimedConcurrent(ConcurrentRateThrottle):
++            def timer(self):
++                return timer_value[0]
++
++        throttle = TimedConcurrent(max_concurrent=1, slot_ttl=30)
++        request = HttpRequest()
++        request.META["REMOTE_ADDR"] = "20.0.0.7"
++
++        timer_value[0] = 0.0
++        assert throttle.allow_request(request) is True
++        assert throttle.allow_request(request) is False
++
++        timer_value[0] = 31.0
++        assert throttle.allow_request(request) is True
++
++
++# ──────────────────────────────────────────────
++# UserConcurrentThrottle and AnonConcurrentThrottle Tests
++# ──────────────────────────────────────────────
++
++
++class TestUserConcurrentThrottle:
++    def setup_method(self):
++        cache.clear()
++
++    def test_importable(self):
++        from ninja_extra.throttling import UserConcurrentThrottle
++
++        assert UserConcurrentThrottle is not None
++
++    def test_authenticated_users_get_distinct_keys(self):
++        from ninja_extra.throttling import UserConcurrentThrottle
++
++        throttle = UserConcurrentThrottle(max_concurrent=2)
++
++        req_a = HttpRequest()
++        user_a = MockUser("ConcUserA")
++        user_a.set_id(77)
++        req_a.user = user_a
++
++        req_b = HttpRequest()
++        user_b = MockUser("ConcUserB")
++        user_b.set_id(88)
++        req_b.user = user_b
++
++        key_a = throttle.get_cache_key(req_a)
++        key_b = throttle.get_cache_key(req_b)
++        assert key_a is not None
++        assert key_b is not None
++        assert key_a != key_b
++
++    def test_per_user_isolation(self):
++        from ninja_extra.throttling import UserConcurrentThrottle
++
++        throttle = UserConcurrentThrottle(max_concurrent=1)
++
++        user_a = MockUser("ConcA")
++        user_a.set_id(uuid.uuid4())
++        req_a = HttpRequest()
++        req_a.user = user_a
++
++        user_b = MockUser("ConcB")
++        user_b.set_id(uuid.uuid4())
++        req_b = HttpRequest()
++        req_b.user = user_b
++
++        assert throttle.allow_request(req_a) is True
++        assert throttle.allow_request(req_a) is False
++        assert throttle.allow_request(req_b) is True
++
++
++class TestAnonConcurrentThrottle:
++    def setup_method(self):
++        cache.clear()
++
++    def test_importable(self):
++        from ninja_extra.throttling import AnonConcurrentThrottle
++
++        assert AnonConcurrentThrottle is not None
++
++    def test_returns_none_for_authenticated(self):
++        from ninja_extra.throttling import AnonConcurrentThrottle
++
++        throttle = AnonConcurrentThrottle(max_concurrent=2)
++        request = HttpRequest()
++        user = MockUser("AnonConcAuth")
++        user.set_id(88)
++        request.user = user
++        assert throttle.get_cache_key(request) is None
++
++    def test_throttles_anonymous_per_ip(self):
++        from ninja_extra.throttling import AnonConcurrentThrottle
++
++        throttle = AnonConcurrentThrottle(max_concurrent=1)
++
++        anon_req = HttpRequest()
++        anon_req.user = None
++        anon_req.META["REMOTE_ADDR"] = "60.60.60.60"
++
++        assert throttle.allow_request(anon_req) is True
++        assert throttle.allow_request(anon_req) is False
++
++
++# ──────────────────────────────────────────────
++# ThrottleBackend Tests
++# ──────────────────────────────────────────────
++
++
++class TestThrottleBackend:
++    def setup_method(self):
++        cache.clear()
++
++    def test_backend_importable(self):
++        from ninja_extra.throttling import CacheThrottleBackend, ThrottleBackend
++
++        assert ThrottleBackend is not None
++        assert CacheThrottleBackend is not None
++
++    def test_throttle_backend_is_abstract(self):
++        """ThrottleBackend cannot be used directly without implementing abstract methods."""
++        from ninja_extra.throttling import ThrottleBackend
++
++        with pytest.raises((NotImplementedError, TypeError)):
++            backend = ThrottleBackend()
++            backend.get_state("any_key")
++
++    def test_token_bucket_works_without_explicit_backend(self):
++        """TokenBucketThrottle works out of the box with no backend argument (uses default)."""
++        from ninja_extra.throttling import TokenBucketThrottle
++
++        class DefaultBackendBucket(TokenBucketThrottle):
++            scope = "default_be"
++            def get_cache_key(self, request):
++                return "token_bucket_default_be_test"
++
++        throttle = DefaultBackendBucket(rate="3/min")
++        request = HttpRequest()
++        request.META["REMOTE_ADDR"] = "70.70.70.80"
++        for _ in range(3):
++            assert throttle.allow_request(request) is True
++        assert throttle.allow_request(request) is False
++
++    def test_concurrent_works_without_explicit_backend(self):
++        """ConcurrentRateThrottle works out of the box with no backend argument (uses default)."""
++        from ninja_extra.throttling import ConcurrentRateThrottle
++
++        throttle = ConcurrentRateThrottle(max_concurrent=2)
++        request = HttpRequest()
++        request.META["REMOTE_ADDR"] = "70.70.70.81"
++        assert throttle.allow_request(request) is True
++        assert throttle.allow_request(request) is True
++        assert throttle.allow_request(request) is False
++
++    def test_cache_backend_get_set_state(self):
++        from ninja_extra.throttling import CacheThrottleBackend
++
++        backend = CacheThrottleBackend()
++        backend.set_state("test_key_gs", {"tokens": 5.0, "ts": 100.0}, ttl=60)
++        state = backend.get_state("test_key_gs")
++        assert state == {"tokens": 5.0, "ts": 100.0}
++
++    def test_cache_backend_delete_state(self):
++        from ninja_extra.throttling import CacheThrottleBackend
++
++        backend = CacheThrottleBackend()
++        backend.set_state("test_key_del", {"tokens": 3.0}, ttl=60)
++        backend.delete_state("test_key_del")
++        assert backend.get_state("test_key_del") is None
++
++    def test_cache_backend_get_nonexistent_returns_none(self):
++        from ninja_extra.throttling import CacheThrottleBackend
++
++        backend = CacheThrottleBackend()
++        assert backend.get_state("nonexistent_key_xyz") is None
++
++    def test_token_bucket_uses_backend(self):
++        from ninja_extra.throttling import (
++            CacheThrottleBackend,
++            TokenBucketThrottle,
++        )
++
++        class BackendBucket(TokenBucketThrottle):
++            scope = "be_test"
++            cache_format = "token_bucket_%(scope)s_%(ident)s"
++
++            def get_cache_key(self, request):
++                return "token_bucket_be_test_backend"
++
++        backend = CacheThrottleBackend()
++        throttle = BackendBucket(rate="3/min", backend=backend)
++        request = HttpRequest()
++        request.META["REMOTE_ADDR"] = "70.70.70.70"
++
++        for _ in range(3):
++            throttle.allow_request(request)
++        assert throttle.allow_request(request) is False
++
++        state = backend.get_state("token_bucket_be_test_backend")
++        assert state is not None
++
++    def test_concurrent_uses_backend(self):
++        from ninja_extra.throttling import (
++            CacheThrottleBackend,
++            ConcurrentRateThrottle,
++        )
++
++        backend = CacheThrottleBackend()
++        throttle = ConcurrentRateThrottle(max_concurrent=1, backend=backend)
++        request = HttpRequest()
++        request.META["REMOTE_ADDR"] = "70.70.70.71"
++
++        assert throttle.allow_request(request) is True
++        assert throttle.allow_request(request) is False
++
++        key = throttle.get_cache_key(request)
++        state = backend.get_state(key)
++        assert state is not None
++
++
++# ──────────────────────────────────────────────
++# Operation Integration Tests
++# ──────────────────────────────────────────────
++
++
++class TestConcurrentWithOperation:
++    def setup_method(self):
++        cache.clear()
++
++    def test_operation_calls_finish_request_on_success(self):
++        from ninja_extra.throttling import ConcurrentRateThrottle
++
++        throttle_instance = ConcurrentRateThrottle(max_concurrent=1)
++
++        api = NinjaExtraAPI(urls_namespace="concurrent_op_success_%s" % uuid.uuid4().hex[:8])
++
++        @api.get("/concurrent_test", throttle=throttle_instance)
++        def concurrent_view(request):
++            return "ok"
++
++        client = TestClient(api)
++        request_meta = {"REMOTE_ADDR": "30.0.0.1"}
++
++        response = client.get("/concurrent_test", META=request_meta)
++        assert response.status_code == 200
++
++        response = client.get("/concurrent_test", META=request_meta)
++        assert response.status_code == 200
++
++    def test_operation_calls_finish_request_on_exception(self):
++        from ninja_extra.throttling import ConcurrentRateThrottle
++
++        throttle_instance = ConcurrentRateThrottle(max_concurrent=1)
++
++        api = NinjaExtraAPI(urls_namespace="concurrent_op_error_%s" % uuid.uuid4().hex[:8])
++
++        @api.get("/concurrent_error", throttle=throttle_instance)
++        def concurrent_error_view(request):
++            raise HttpError(500, "intentional error")
++
++        client = TestClient(api)
++        request_meta = {"REMOTE_ADDR": "30.0.0.2"}
++
++        response = client.get("/concurrent_error", META=request_meta)
++        assert response.status_code == 500
++
++        response = client.get("/concurrent_error", META=request_meta)
++        assert response.status_code == 500
++
++    @pytest.mark.skipif(django.VERSION < (3, 1), reason="requires django 3.1+")
++    @pytest.mark.asyncio
++    async def test_async_operation_calls_finish_request(self):
++        from ninja_extra.throttling import ConcurrentRateThrottle
++
++        throttle_instance = ConcurrentRateThrottle(max_concurrent=1)
++
++        api = NinjaExtraAPI(urls_namespace="concurrent_async_%s" % uuid.uuid4().hex[:8])
++
++        @api.get("/concurrent_async", throttle=throttle_instance)
++        async def concurrent_async_view(request):
++            return "async_ok"
++
++        client = TestAsyncClient(api)
++
++        response = await client.get("/concurrent_async", META={"REMOTE_ADDR": "30.0.0.3"})
++        assert response.status_code == 200
++
++        response = await client.get("/concurrent_async", META={"REMOTE_ADDR": "30.0.0.3"})
++        assert response.status_code == 200
++
++    @pytest.mark.skipif(django.VERSION < (3, 1), reason="requires django 3.1+")
++    @pytest.mark.asyncio
++    async def test_async_operation_finish_request_on_error(self):
++        from ninja_extra.throttling import ConcurrentRateThrottle
++
++        throttle_instance = ConcurrentRateThrottle(max_concurrent=1)
++
++        api = NinjaExtraAPI(urls_namespace="concurrent_async_err_%s" % uuid.uuid4().hex[:8])
++
++        @api.get("/concurrent_async_err", throttle=throttle_instance)
++        async def concurrent_async_error(request):
++            raise HttpError(500, "async error")
++
++        client = TestAsyncClient(api)
++
++        response = await client.get("/concurrent_async_err", META={"REMOTE_ADDR": "30.0.0.4"})
++        assert response.status_code == 500
++
++        response = await client.get("/concurrent_async_err", META={"REMOTE_ADDR": "30.0.0.4"})
++        assert response.status_code == 500
++
++    def test_operation_finish_request_called_for_every_throttle_in_list(self):
++        from ninja_extra.throttling import ConcurrentRateThrottle
++
++        class ThrottleA(ConcurrentRateThrottle):
++            scope = "multi_a"
++
++        class ThrottleB(ConcurrentRateThrottle):
++            scope = "multi_b"
++
++        inst_a = ThrottleA(max_concurrent=1)
++        inst_b = ThrottleB(max_concurrent=1)
++
++        api = NinjaExtraAPI(urls_namespace="multi_finish_%s" % uuid.uuid4().hex[:8])
++
++        @api.get("/multi_finish", throttle=[inst_a, inst_b])
++        def multi_view(request):
++            return "ok"
++
++        client = TestClient(api)
++        meta = {"REMOTE_ADDR": "30.0.0.10"}
++
++        # First request succeeds and should release both throttles
++        response = client.get("/multi_finish", META=meta)
++        assert response.status_code == 200
++
++        # Second request also succeeds because finish_request freed both slots
++        response = client.get("/multi_finish", META=meta)
++        assert response.status_code == 200
++
++        # Third request also succeeds — confirms both were properly released each time
++        response = client.get("/multi_finish", META=meta)
++        assert response.status_code == 200
++
++
++# ──────────────────────────────────────────────
++# Throttle Signals Tests
++# ──────────────────────────────────────────────
++
++
++class TestThrottleSignals:
++    def setup_method(self):
++        cache.clear()
++
++    def test_signals_importable_from_throttling(self):
++        from ninja_extra.throttling import (
++            throttle_request_allowed,
++            throttle_request_denied,
++        )
++
++        assert isinstance(throttle_request_allowed, Signal)
++        assert isinstance(throttle_request_denied, Signal)
++
++    def test_allowed_signal_fires_on_successful_request(self):
++        from ninja_extra.throttling import (
++            UserRateThrottle,
++            throttle_request_allowed,
++        )
++
++        received = []
++
++        def handler(sender, **kwargs):
++            received.append({
++                "sender": sender,
++                "request": kwargs.get("request"),
++                "throttle": kwargs.get("throttle"),
++            })
++
++        throttle_request_allowed.connect(handler)
++        try:
++            user = MockUser("SignalUser")
++            user.set_id(uuid.uuid4())
++
++            api = NinjaExtraAPI(urls_namespace="signal_allowed_%s" % uuid.uuid4().hex[:8])
++
++            @api.get("/signal_allow", throttle=UserRateThrottle("10/sec"))
++            def signal_allow_view(request):
++                return "ok"
++
++            client = TestClient(api)
++            response = client.get("/signal_allow", user=user)
++            assert response.status_code == 200
++
++            assert len(received) >= 1
++            assert received[0]["sender"] == UserRateThrottle
++            assert received[0]["throttle"] is not None
++        finally:
++            throttle_request_allowed.disconnect(handler)
++
++    def test_denied_signal_fires_on_throttled_request(self):
++        from ninja_extra.throttling import (
++            UserRateThrottle,
++            throttle_request_denied,
++        )
++
++        received = []
++
++        def handler(sender, **kwargs):
++            received.append({
++                "sender": sender,
++                "request": kwargs.get("request"),
++                "throttle": kwargs.get("throttle"),
++            })
++
++        throttle_request_denied.connect(handler)
++        try:
++            user = MockUser("DeniedUser")
++            user.set_id(uuid.uuid4())
++
++            api = NinjaExtraAPI(urls_namespace="signal_denied_%s" % uuid.uuid4().hex[:8])
++
++            @api.get("/signal_deny", throttle=UserRateThrottle("1/sec"))
++            def signal_deny_view(request):
++                return "ok"
++
++            client = TestClient(api)
++            client.get("/signal_deny", user=user)
++            try:
++                client.get("/signal_deny", user=user)
++            except Exception:
++                pass
++
++            assert len(received) >= 1
++            assert received[0]["sender"] == UserRateThrottle
++            assert received[0]["throttle"] is not None
++            assert received[0]["request"] is not None
++        finally:
++            throttle_request_denied.disconnect(handler)
++
++    def test_allowed_signal_fires_once_per_throttle_in_list(self):
++        from ninja_extra.throttling import (
++            UserRateThrottle,
++            throttle_request_allowed,
++        )
++
++        received = []
++
++        def handler(sender, **kwargs):
++            received.append({
++                "sender": sender,
++                "throttle": kwargs.get("throttle"),
++            })
++
++        throttle_request_allowed.connect(handler)
++        try:
++            user = MockUser("MultiSigUser")
++            user.set_id(uuid.uuid4())
++
++            throttle_a = UserRateThrottle("10/sec")
++            throttle_b = UserRateThrottle("10/sec")
++
++            api = NinjaExtraAPI(urls_namespace="multi_sig_%s" % uuid.uuid4().hex[:8])
++
++            @api.get("/multi_sig", throttle=[throttle_a, throttle_b])
++            def multi_sig_view(request):
++                return "ok"
++
++            client = TestClient(api)
++            response = client.get("/multi_sig", user=user)
++            assert response.status_code == 200
++
++            # Each throttle that allowed the request should fire the signal once
++            assert len(received) >= 2
++        finally:
++            throttle_request_allowed.disconnect(handler)
++
++    def test_denied_signal_fires_for_each_throttle_in_list(self):
++        from ninja_extra.throttling import (
++            UserRateThrottle,
++            throttle_request_denied,
++        )
++
++        class ThrottleA(UserRateThrottle):
++            scope = "deny_scope_a"
++
++        class ThrottleB(UserRateThrottle):
++            scope = "deny_scope_b"
++
++        received = []
++
++        def handler(sender, **kwargs):
++            received.append({
++                "sender": sender,
++                "request": kwargs.get("request"),
++                "throttle": kwargs.get("throttle"),
++            })
++
++        throttle_request_denied.connect(handler)
++        try:
++            user = MockUser("MultiDenyUser")
++            user.set_id(uuid.uuid4())
++
++            throttle_a = ThrottleA("1/sec")
++            throttle_b = ThrottleB("1/sec")
++
++            api = NinjaExtraAPI(urls_namespace="multi_deny_%s" % uuid.uuid4().hex[:8])
++
++            @api.get("/multi_deny", throttle=[throttle_a, throttle_b])
++            def multi_deny_view(request):
++                return "ok"
++
++            client = TestClient(api)
++            # First request passes both throttles
++            client.get("/multi_deny", user=user)
++            received.clear()
++            # Second request: both throttles deny, signal fires for each
++            try:
++                client.get("/multi_deny", user=user)
++            except Exception:
++                pass
++
++            assert len(received) == 2
++            senders = {r["sender"] for r in received}
++            assert ThrottleA in senders
++            assert ThrottleB in senders
++            assert all(r["request"] is not None for r in received)
++            assert all(r["throttle"] is not None for r in received)
++        finally:
++            throttle_request_denied.disconnect(handler)
++
++    def test_signal_kwargs_contain_request_object(self):
++        from ninja_extra.throttling import (
++            UserRateThrottle,
++            throttle_request_allowed,
++        )
++
++        received = []
++
++        def handler(sender, **kwargs):
++            received.append(kwargs)
++
++        throttle_request_allowed.connect(handler)
++        try:
++            user = MockUser("KwargsUser")
++            user.set_id(uuid.uuid4())
++
++            api = NinjaExtraAPI(urls_namespace="signal_kwargs_%s" % uuid.uuid4().hex[:8])
++
++            @api.get("/signal_kwargs", throttle=UserRateThrottle("10/sec"))
++            def signal_kwargs_view(request):
++                return "ok"
++
++            client = TestClient(api)
++            client.get("/signal_kwargs", user=user)
++
++            assert len(received) >= 1
++            assert "request" in received[0]
++            assert "throttle" in received[0]
++            assert received[0]["request"] is not None
++        finally:
++            throttle_request_allowed.disconnect(handler)
++
++
++# ──────────────────────────────────────────────
++# Throttled Exception retry_after Tests
++# ──────────────────────────────────────────────
++
++
++class TestThrottledRetryAfter:
++    def test_retry_after_is_integer_ceil_of_wait(self):
++        exc = Throttled(wait=2.3)
++        assert exc.retry_after == 3
++
++    def test_retry_after_is_none_when_wait_is_none(self):
++        exc = Throttled(wait=None)
++        assert exc.retry_after is None
++
++    def test_retry_after_exact_integer_wait(self):
++        exc = Throttled(wait=5.0)
++        assert exc.retry_after == 5
++
++    def test_retry_after_small_fractional_wait(self):
++        exc = Throttled(wait=0.1)
++        assert exc.retry_after == 1
++
++    def test_retry_after_accessible_on_throttled_response(self):
++        user = MockUser("RetryUser")
++        user.set_id(uuid.uuid4())
++
++        api = NinjaExtraAPI(urls_namespace="retry_after_%s" % uuid.uuid4().hex[:8])
++
++        @api.get("/retry_test", throttle=UserRateThrottle("1/min"))
++        def retry_view(request):
++            return "ok"
++
++        client = TestClient(api)
++        client.get("/retry_test", user=user)
++        response = client.get("/retry_test", user=user)
++        assert response.status_code == 429
++
++
++# ──────────────────────────────────────────────
++# Signals with New Throttle Types
++# ──────────────────────────────────────────────
++
++
++class TestSignalsWithNewThrottles:
++    def setup_method(self):
++        cache.clear()
++
++    def test_allowed_signal_fires_for_token_bucket_throttle(self):
++        from ninja_extra.throttling import (
++            TokenBucketThrottle,
++            throttle_request_allowed,
++        )
++
++        class SignalBucket(TokenBucketThrottle):
++            scope = "signal_bucket"
++            def get_cache_key(self, request):
++                return "token_bucket_signal_bucket_" + (self.get_ident(request) or "anon")
++
++        received = []
++        def handler(sender, **kwargs):
++            received.append({"sender": sender, "throttle": kwargs.get("throttle")})
++
++        throttle_request_allowed.connect(handler)
++        try:
++            throttle_inst = SignalBucket(rate="10/min")
++            api = NinjaExtraAPI(urls_namespace="sig_bucket_%s" % uuid.uuid4().hex[:8])
++
++            @api.get("/sig_bucket", throttle=throttle_inst)
++            def sig_bucket_view(request):
++                return "ok"
++
++            client = TestClient(api)
++            response = client.get("/sig_bucket", META={"REMOTE_ADDR": "40.0.0.1"})
++            assert response.status_code == 200
++            assert any(r["sender"] == SignalBucket for r in received)
++        finally:
++            throttle_request_allowed.disconnect(handler)
++
++    def test_denied_signal_fires_for_concurrent_throttle(self):
++        from ninja_extra.throttling import (
++            ConcurrentRateThrottle,
++            throttle_request_denied,
++        )
++
++        received = []
++        def handler(sender, **kwargs):
++            received.append({"sender": sender, "throttle": kwargs.get("throttle")})
++
++        throttle_request_denied.connect(handler)
++        try:
++            throttle_inst = ConcurrentRateThrottle(max_concurrent=1)
++            api = NinjaExtraAPI(urls_namespace="sig_conc_deny_%s" % uuid.uuid4().hex[:8])
++
++            @api.get("/sig_conc", throttle=throttle_inst)
++            def sig_conc_view(request):
++                return "ok"
++
++            client = TestClient(api)
++            # Pre-exhaust the slot directly so the operation's _check_throttles sees it full
++            request = HttpRequest()
++            request.META["REMOTE_ADDR"] = "40.0.0.2"
++            throttle_inst.allow_request(request)  # acquires the single slot
++            # Now the operation request should be denied by _check_throttles
++            response = client.get("/sig_conc", META={"REMOTE_ADDR": "40.0.0.2"})
++            assert response.status_code == 429
++            assert any(r["sender"] == ConcurrentRateThrottle for r in received)
++        finally:
++            throttle_request_denied.disconnect(handler)

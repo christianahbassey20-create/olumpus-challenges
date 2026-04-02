@@ -1,0 +1,917 @@
+diff --git a/ninja_extra/exceptions.py b/ninja_extra/exceptions.py
+index 10a775a..d935aad 100644
+--- a/ninja_extra/exceptions.py
++++ b/ninja_extra/exceptions.py
+@@ -269,6 +269,7 @@ class Throttled(APIException):
+                 )
+             )
+         self.wait = wait
++        self.retry_after = math.ceil(wait) if wait is not None else None
+         super().__init__(detail, code)
+ 
+ 
+diff --git a/ninja_extra/operation.py b/ninja_extra/operation.py
+index 61376e7..66fd5a2 100644
+--- a/ninja_extra/operation.py
++++ b/ninja_extra/operation.py
+@@ -189,6 +189,24 @@ class Operation(NinjaOperation):
+             # send route_context_finished signal
+             ROUTE_CONTEXT_VAR.set(None)
+ 
++    def _finish_concurrent_throttles(self, request: HttpRequest) -> None:
++        """
++        Release concurrent throttle slots for all ConcurrentRateThrottle
++        instances in the throttle_objects list.
++
++        This must be called after every request completes (success or error)
++        to free up concurrent slots. It is safe to call even if no
++        ConcurrentRateThrottle instances are configured.
++        """
++        from ninja_extra.throttling.model import ConcurrentRateThrottle
++
++        for throttle_obj in self.throttle_objects:
++            if isinstance(throttle_obj, ConcurrentRateThrottle):
++                try:
++                    throttle_obj.finish_request(request)
++                except Exception:
++                    pass  # Best-effort cleanup
++
+     def run(self, request: HttpRequest, **kw: Any) -> HttpResponseBase:
+         try:
+             with self._prep_run(
+@@ -224,12 +242,30 @@ class Operation(NinjaOperation):
+                 msg = f"{e.args[0]}: {msg}" if e.args else msg
+                 e.args = (msg,) + e.args[1:]
+             return self.api.on_exception(request, e)
++        finally:
++            self._finish_concurrent_throttles(request)
+ 
+     def _check_throttles(self, request: HttpRequest) -> Optional[HttpResponse]:
++        from ninja_extra.throttling.signals import (
++            throttle_request_allowed,
++            throttle_request_denied,
++        )
++
+         throttle_durations = []
+         for throttle in self.throttle_objects:
+             if not throttle.allow_request(request):
+                 throttle_durations.append(throttle.wait())
++                throttle_request_denied.send(
++                    sender=throttle.__class__,
++                    request=request,
++                    throttle=throttle,
++                )
++            else:
++                throttle_request_allowed.send(
++                    sender=throttle.__class__,
++                    request=request,
++                    throttle=throttle,
++                )
+ 
+         if throttle_durations:
+             # Filter out `None` values which may happen in case of config / rate
+@@ -313,6 +349,8 @@ class AsyncOperation(Operation, NinjaAsyncOperation):
+                 return cast(HttpResponseBase, _processed_results)
+         except Exception as e:
+             return self.api.on_exception(request, e)
++        finally:
++            self._finish_concurrent_throttles(request)
+ 
+ 
+ class PathView(NinjaPathView):
+diff --git a/ninja_extra/throttling/__init__.py b/ninja_extra/throttling/__init__.py
+index e051c4e..f83799a 100644
+--- a/ninja_extra/throttling/__init__.py
++++ b/ninja_extra/throttling/__init__.py
+@@ -1,12 +1,20 @@
+ from ninja.throttling import BaseThrottle
+ 
++from .backends import CacheThrottleBackend, ThrottleBackend
+ from .decorator import throttle
+ from .model import (
++    AnonConcurrentThrottle,
+     AnonRateThrottle,
++    AnonTokenBucketThrottle,
++    ConcurrentRateThrottle,
+     DynamicRateThrottle,
+     SimpleRateThrottle,
++    TokenBucketThrottle,
++    UserConcurrentThrottle,
+     UserRateThrottle,
++    UserTokenBucketThrottle,
+ )
++from .signals import throttle_request_allowed, throttle_request_denied
+ 
+ __all__ = [
+     "BaseThrottle",
+@@ -15,4 +23,14 @@ __all__ = [
+     "SimpleRateThrottle",
+     "AnonRateThrottle",
+     "throttle",
++    "TokenBucketThrottle",
++    "UserTokenBucketThrottle",
++    "AnonTokenBucketThrottle",
++    "ConcurrentRateThrottle",
++    "UserConcurrentThrottle",
++    "AnonConcurrentThrottle",
++    "ThrottleBackend",
++    "CacheThrottleBackend",
++    "throttle_request_allowed",
++    "throttle_request_denied",
+ ]
+diff --git a/ninja_extra/throttling/backends.py b/ninja_extra/throttling/backends.py
+new file mode 100644
+index 0000000..54656b0
+--- /dev/null
++++ b/ninja_extra/throttling/backends.py
+@@ -0,0 +1,120 @@
++"""
++Abstract throttle backend and cache-based implementation.
++"""
++import abc
++from typing import Any, Dict, Optional
++
++from django.core.cache import cache as default_cache
++
++
++class ThrottleBackend(abc.ABC):
++    """
++    Abstract base class for throttle state storage backends.
++
++    All throttle backends must implement get_state, set_state, and delete_state
++    to provide a consistent interface for throttle classes to persist their
++    per-client state (token counts, slot lists, timestamps, etc.).
++    """
++
++    @abc.abstractmethod
++    def get_state(self, key: str) -> Optional[Dict[str, Any]]:
++        """
++        Retrieve the stored state for the given key.
++
++        Returns:
++            The stored state dictionary, or None if no state exists.
++        """
++        ...  # pragma: no cover
++
++    @abc.abstractmethod
++    def set_state(self, key: str, state: Dict[str, Any], ttl: Optional[int] = None) -> None:
++        """
++        Store state for the given key.
++
++        Args:
++            key: The cache key to store state under.
++            state: A dictionary of state data to persist.
++            ttl: Optional time-to-live in seconds. If None, use the backend's
++                 default expiry behavior.
++        """
++        ...  # pragma: no cover
++
++    @abc.abstractmethod
++    def delete_state(self, key: str) -> None:
++        """
++        Remove the stored state for the given key.
++
++        Args:
++            key: The cache key whose state should be deleted.
++        """
++        ...  # pragma: no cover
++
++
++class CacheThrottleBackend(ThrottleBackend):
++    """
++    Throttle backend that delegates storage to Django's cache framework.
++
++    Uses the default cache (django.core.cache.cache) to store and retrieve
++    throttle state. This is the default backend for all new throttle classes.
++
++    The cache key namespace and TTL behavior are determined by the throttle
++    classes that use this backend. This backend simply provides a thin
++    wrapper around Django's cache get/set/delete operations, ensuring the
++    state is serialized as dictionaries.
++
++    Attributes:
++        cache: The Django cache instance to use for storage. Defaults to
++               the default cache configured in settings.
++    """
++
++    def __init__(self, cache: Any = None) -> None:
++        """
++        Initialize the cache backend.
++
++        Args:
++            cache: An optional Django cache instance. If not provided,
++                   django.core.cache.cache (the default cache) is used.
++        """
++        self.cache = cache if cache is not None else default_cache
++
++    def get_state(self, key: str) -> Optional[Dict[str, Any]]:
++        """
++        Retrieve state from the Django cache.
++
++        Args:
++            key: The cache key to look up.
++
++        Returns:
++            The stored state dictionary, or None if the key does not exist
++            or has expired.
++        """
++        value = self.cache.get(key)
++        if value is None:
++            return None
++        if isinstance(value, dict):
++            return value
++        return None
++
++    def set_state(self, key: str, state: Dict[str, Any], ttl: Optional[int] = None) -> None:
++        """
++        Store state in the Django cache.
++
++        Args:
++            key: The cache key to store under.
++            state: The state dictionary to persist.
++            ttl: Time-to-live in seconds. If None, uses the cache's default
++                 timeout.
++        """
++        if ttl is not None:
++            self.cache.set(key, state, ttl)
++        else:
++            self.cache.set(key, state)
++
++    def delete_state(self, key: str) -> None:
++        """
++        Remove state from the Django cache.
++
++        Args:
++            key: The cache key to delete.
++        """
++        self.cache.delete(key)
+diff --git a/ninja_extra/throttling/model.py b/ninja_extra/throttling/model.py
+index fd44ff9..698b89e 100644
+--- a/ninja_extra/throttling/model.py
++++ b/ninja_extra/throttling/model.py
+@@ -160,3 +160,644 @@ class DynamicRateThrottle(SimpleRateThrottle):
+             ident = self.get_ident(request)
+ 
+         return self.cache_format % {"scope": self.scope, "ident": ident}
++
++
++# ──────────────────────────────────────────────────────────────────────────────
++# Advanced Throttle Classes
++# ──────────────────────────────────────────────────────────────────────────────
++
++from .backends import CacheThrottleBackend, ThrottleBackend
++
++
++class TokenBucketThrottle(SimpleRateThrottle):
++    """
++    Token-bucket rate-limiting throttle.
++
++    Maintains a bucket of tokens per client identity. Each allowed request
++    consumes exactly one token. Tokens refill at a steady rate of
++    (capacity / period_seconds) tokens per second, up to the maximum capacity.
++
++    The bucket state (remaining token count and last refill timestamp) is
++    stored via a ThrottleBackend instance, defaulting to CacheThrottleBackend.
++
++    Rate format: "capacity/period" where period is one of
++    s, sec, m, min, h, hour, d, day.
++
++    Cache key format: "token_bucket_%(scope)s_%(ident)s"
++    """
++
++    cache_format: str = "token_bucket_%(scope)s_%(ident)s"
++    scope: Optional[str] = None
++    _remaining: Optional[float] = None
++    _last_refill: Optional[float] = None
++    _backend: Optional[ThrottleBackend] = None
++
++    def __init__(
++        self,
++        rate: Optional[str] = None,
++        backend: Optional[ThrottleBackend] = None,
++    ) -> None:
++        """
++        Initialize the token bucket throttle.
++
++        Args:
++            rate: Rate string in "number/period" format. If not provided,
++                  the rate is looked up from THROTTLE_RATES using self.scope.
++            backend: Storage backend for token state. Defaults to
++                     CacheThrottleBackend if not provided.
++        """
++        self._backend = backend if backend is not None else CacheThrottleBackend()
++        self._remaining = None
++        self._last_refill = None
++        self._last_cache_key = None
++
++        if rate is not None:
++            # Explicit rate provided - use it directly
++            try:
++                super().__init__(rate)
++            except ImproperlyConfigured:
++                # rate=None or scope missing is okay for token bucket
++                self.rate = None
++                self.num_requests = None
++                self.duration = None
++        else:
++            # Try scope-based lookup; if no scope or rate found,
++            # we still construct successfully but with rate=None
++            try:
++                super().__init__(rate)
++            except ImproperlyConfigured:
++                self.rate = None
++                self.num_requests = None
++                self.duration = None
++
++    @property
++    def capacity(self) -> Optional[int]:
++        """The maximum number of tokens in the bucket (equals num_requests)."""
++        return self.num_requests
++
++    @property
++    def refill_rate(self) -> Optional[float]:
++        """
++        Tokens refilled per second.
++
++        Computed as capacity / duration (period in seconds).
++        Returns None if rate is not configured.
++        """
++        if self.num_requests is None or self.duration is None or self.duration == 0:
++            return None
++        return self.num_requests / self.duration
++
++    def _get_current_time(self) -> float:
++        """Get the current time using the throttle's timer."""
++        return self.timer()
++
++    def _load_bucket_state(self, cache_key: str) -> Dict[str, float]:
++        """
++        Load the current bucket state from the backend.
++
++        If no state exists, initializes a full bucket at the current time.
++
++        Args:
++            cache_key: The cache key for this client's bucket.
++
++        Returns:
++            A dictionary with 'remaining' (float) and 'last_refill' (float).
++        """
++        state = self._backend.get_state(cache_key)
++        if state is not None and "remaining" in state and "last_refill" in state:
++            return {
++                "remaining": float(state["remaining"]),
++                "last_refill": float(state["last_refill"]),
++            }
++        # Initialize a full bucket
++        now = self._get_current_time()
++        initial_state = {
++            "remaining": float(self.capacity if self.capacity else 0),
++            "last_refill": now,
++        }
++        return initial_state
++
++    def _save_bucket_state(
++        self, cache_key: str, remaining: float, last_refill: float
++    ) -> None:
++        """
++        Persist the bucket state to the backend.
++
++        Args:
++            cache_key: The cache key for this client's bucket.
++            remaining: Current number of remaining tokens.
++            last_refill: Timestamp of the last refill calculation.
++        """
++        state = {"remaining": remaining, "last_refill": last_refill}
++        # Use a TTL that's long enough to cover the full refill period
++        # plus some buffer. We use 2x the duration to be safe.
++        ttl = (self.duration * 2) if self.duration else 3600
++        self._backend.set_state(cache_key, state, ttl=int(ttl))
++
++    def _refill_tokens(
++        self, remaining: float, last_refill: float, now: float
++    ) -> tuple:
++        """
++        Calculate the new token count after refilling based on elapsed time.
++
++        Tokens refill at exactly (capacity / period_seconds) tokens per second,
++        capped at the bucket capacity.
++
++        Args:
++            remaining: Current token count before refill.
++            last_refill: Timestamp of the last refill.
++            now: Current timestamp.
++
++        Returns:
++            A tuple of (new_remaining, new_last_refill).
++        """
++        if self.refill_rate is None or self.capacity is None:
++            return remaining, last_refill
++
++        elapsed = max(0.0, now - last_refill)
++        tokens_to_add = elapsed * self.refill_rate
++        new_remaining = min(float(self.capacity), remaining + tokens_to_add)
++        return new_remaining, now
++
++    def allow_request(self, request: HttpRequest) -> bool:
++        """
++        Check if the request should be allowed based on token availability.
++
++        Loads the current bucket state, refills tokens based on elapsed time,
++        and either consumes a token (allowing the request) or denies it.
++
++        Args:
++            request: The incoming HTTP request.
++
++        Returns:
++            True if the request is allowed (a token was consumed),
++            False if no tokens are available.
++        """
++        if self.rate is None:
++            return True
++
++        cache_key = self.get_cache_key(request)
++        if cache_key is None:
++            return True
++
++        self._last_cache_key = cache_key
++        now = self._get_current_time()
++
++        # Load current state
++        bucket = self._load_bucket_state(cache_key)
++        remaining = bucket["remaining"]
++        last_refill = bucket["last_refill"]
++
++        # Refill tokens based on elapsed time
++        remaining, last_refill = self._refill_tokens(remaining, last_refill, now)
++
++        # Try to consume a token
++        if remaining >= 1.0:
++            remaining -= 1.0
++            self._remaining = remaining
++            self._last_refill = last_refill
++            self._save_bucket_state(cache_key, remaining, last_refill)
++            return self.throttle_success()
++        else:
++            self._remaining = remaining
++            self._last_refill = last_refill
++            self._save_bucket_state(cache_key, remaining, last_refill)
++            return self.throttle_failure()
++
++    def throttle_success(self) -> bool:
++        """Called when a request is allowed."""
++        return True
++
++    def throttle_failure(self) -> bool:
++        """Called when a request is denied due to token exhaustion."""
++        return False
++
++    def wait(self) -> Optional[float]:
++        """
++        Calculate the number of seconds until the next whole token is available.
++
++        Uses the formula: (1 - remaining_tokens) / refill_rate
++        where refill_rate = capacity / period_seconds.
++
++        Returns:
++            Seconds to wait for the next token, or None if rate is unconfigured.
++        """
++        if self.refill_rate is None:
++            return None
++
++        if self._remaining is None:
++            return None
++
++        # Calculate time until we have at least 1 token
++        tokens_needed = 1.0 - self._remaining
++        if tokens_needed <= 0:
++            return 0.0
++
++        wait_seconds = tokens_needed / self.refill_rate
++        return wait_seconds
++
++    def get_cache_key(self, request: HttpRequest) -> Optional[str]:
++        """
++        Generate the cache key for token bucket state.
++
++        Default implementation uses the client IP address.
++        Subclasses should override for user-specific behavior.
++
++        Args:
++            request: The incoming HTTP request.
++
++        Returns:
++            A cache key string, or None if this request should not be throttled.
++        """
++        ident = self.get_ident(request)
++        if not ident:
++            return None
++        return self.cache_format % {"scope": self.scope or "default", "ident": ident}
++
++
++class UserTokenBucketThrottle(TokenBucketThrottle):
++    """
++    Token bucket throttle keyed by authenticated user PK.
++
++    For authenticated users, uses the user's pk as the cache key identifier.
++    For anonymous users, falls back to the client IP address.
++
++    This mirrors the cache-key behavior of UserRateThrottle.
++    """
++
++    scope = "user"
++    cache_format = "token_bucket_%(scope)s_%(ident)s"
++
++    def get_cache_key(self, request: HttpRequest) -> Optional[str]:
++        """
++        Generate a per-user cache key.
++
++        Uses user.pk for authenticated users, IP address for anonymous.
++
++        Args:
++            request: The incoming HTTP request.
++
++        Returns:
++            A cache key string uniquely identifying this user's token bucket.
++        """
++        user = getattr(request, "user", None)
++        if user is not None and getattr(user, "is_authenticated", False):
++            ident = user.pk
++        else:
++            ident = self.get_ident(request)
++        return self.cache_format % {"scope": self.scope, "ident": ident}
++
++
++class AnonTokenBucketThrottle(TokenBucketThrottle):
++    """
++    Token bucket throttle that only applies to anonymous (unauthenticated)
++    requests, keyed by client IP address.
++
++    Returns None for authenticated users, effectively skipping the throttle.
++    This mirrors the cache-key behavior of AnonRateThrottle.
++    """
++
++    scope = "anon"
++    cache_format = "token_bucket_%(scope)s_%(ident)s"
++
++    def get_cache_key(self, request: HttpRequest) -> Optional[str]:
++        """
++        Generate a cache key for anonymous users only.
++
++        Returns None for authenticated users (no throttling applied).
++        Uses the client IP address for anonymous users.
++
++        Args:
++            request: The incoming HTTP request.
++
++        Returns:
++            A cache key string for anonymous users, or None for authenticated.
++        """
++        user = getattr(request, "user", None)
++        if user is not None and getattr(user, "is_authenticated", False):
++            return None
++        ident = self.get_ident(request)
++        return self.cache_format % {"scope": self.scope, "ident": ident}
++
++
++class ConcurrentRateThrottle(SimpleRateThrottle):
++    """
++    Limits the number of simultaneous in-flight requests per client identity.
++
++    Instead of tracking request rates over time, this throttle tracks the
++    number of currently active (in-flight) requests. Each call to
++    allow_request() acquires a slot, and finish_request() releases it.
++
++    Slots are stored as a list of dictionaries, where each entry contains
++    a unique request identifier and a timestamp. Slots that exceed the
++    configured slot_ttl are automatically cleaned up to prevent stale locks
++    from permanently blocking requests.
++
++    The throttle supports configurable max_concurrent (default 1) and
++    slot_ttl (default 30 seconds) parameters.
++
++    Cache key format: "concurrent_%(scope)s_%(ident)s"
++
++    Integration note: Operation.run() and AsyncOperation.run() must invoke
++    finish_request() on all ConcurrentRateThrottle instances in their
++    throttle_objects list in a finally block.
++    """
++
++    cache_format: str = "concurrent_%(scope)s_%(ident)s"
++    scope: str = "concurrent"
++    _backend: Optional[ThrottleBackend] = None
++
++    def __init__(
++        self,
++        max_concurrent: int = 1,
++        slot_ttl: int = 30,
++        rate: Optional[str] = None,
++        backend: Optional[ThrottleBackend] = None,
++    ) -> None:
++        """
++        Initialize the concurrent rate throttle.
++
++        Args:
++            max_concurrent: Maximum number of simultaneous in-flight requests
++                           allowed per client identity. Defaults to 1.
++            slot_ttl: Time-to-live in seconds for individual slots. Slots
++                     older than this are considered expired and automatically
++                     cleaned up. Defaults to 30 seconds.
++            rate: Optional rate string. Not used for concurrency limiting
++                  but accepted for API compatibility with SimpleRateThrottle.
++            backend: Storage backend for slot state. Defaults to
++                     CacheThrottleBackend if not provided.
++        """
++        self.max_concurrent = max_concurrent
++        self.slot_ttl = slot_ttl
++        self._backend = backend if backend is not None else CacheThrottleBackend()
++        self._current_request_id: Optional[str] = None
++        self._last_cache_key: Optional[str] = None
++
++        # Initialize with rate=None since concurrent throttle
++        # does not use rate-based limiting
++        try:
++            super().__init__(rate)
++        except ImproperlyConfigured:
++            self.rate = None
++            self.num_requests = None
++            self.duration = None
++
++    def _get_current_time(self) -> float:
++        """Get the current time using the throttle's timer."""
++        return self.timer()
++
++    def _generate_slot_id(self) -> str:
++        """
++        Generate a unique identifier for a request slot.
++
++        Returns:
++            A unique string identifier for the current request's slot.
++        """
++        import uuid
++
++        return uuid.uuid4().hex
++
++    def _load_slots(self, cache_key: str) -> List[Dict[str, Any]]:
++        """
++        Load the current slot list from the backend.
++
++        Args:
++            cache_key: The cache key for this client's slot list.
++
++        Returns:
++            A list of slot dictionaries, each containing 'id' and 'timestamp'.
++        """
++        state = self._backend.get_state(cache_key)
++        if state is not None and "slots" in state:
++            return list(state["slots"])
++        return []
++
++    def _save_slots(self, cache_key: str, slots: List[Dict[str, Any]]) -> None:
++        """
++        Persist the slot list to the backend.
++
++        Args:
++            cache_key: The cache key for this client's slot list.
++            slots: The list of active slot dictionaries.
++        """
++        state = {"slots": slots}
++        # Use a TTL that's generous enough to cover the slot lifetime
++        # plus cleanup cycles
++        ttl = self.slot_ttl * 3 if self.slot_ttl else 90
++        self._backend.set_state(cache_key, state, ttl=ttl)
++
++    def _cleanup_expired_slots(
++        self, slots: List[Dict[str, Any]], now: float
++    ) -> List[Dict[str, Any]]:
++        """
++        Remove slots that have exceeded the slot_ttl.
++
++        Stale slots are identified by comparing their timestamp against
++        the current time minus the TTL threshold. This prevents permanently
++        locked slots from blocking new requests if a response was never
++        completed (e.g., server crash, timeout).
++
++        Args:
++            slots: The current list of slot dictionaries.
++            now: The current timestamp.
++
++        Returns:
++            A filtered list containing only non-expired slots.
++        """
++        cutoff = now - self.slot_ttl
++        active_slots = []
++        for slot in slots:
++            slot_timestamp = float(slot.get("timestamp", 0))
++            if slot_timestamp > cutoff:
++                active_slots.append(slot)
++        return active_slots
++
++    def allow_request(self, request: HttpRequest) -> bool:
++        """
++        Check if the request can acquire a concurrent slot.
++
++        Loads the current slot list, cleans up expired entries, and either
++        acquires a new slot (allowing the request) or denies it if the
++        max_concurrent limit has been reached.
++
++        Args:
++            request: The incoming HTTP request.
++
++        Returns:
++            True if a slot was acquired, False if the limit is reached.
++        """
++        cache_key = self.get_cache_key(request)
++        if cache_key is None:
++            return True
++
++        self._last_cache_key = cache_key
++        now = self._get_current_time()
++
++        # Load and clean up slots
++        slots = self._load_slots(cache_key)
++        slots = self._cleanup_expired_slots(slots, now)
++
++        # Check if we have capacity
++        if len(slots) >= self.max_concurrent:
++            self._save_slots(cache_key, slots)
++            return self.throttle_failure()
++
++        # Acquire a new slot
++        slot_id = self._generate_slot_id()
++        self._current_request_id = slot_id
++        new_slot = {"id": slot_id, "timestamp": now}
++        slots.append(new_slot)
++        self._save_slots(cache_key, slots)
++        return self.throttle_success()
++
++    def throttle_success(self) -> bool:
++        """Called when a concurrent slot is acquired."""
++        return True
++
++    def throttle_failure(self) -> bool:
++        """Called when the concurrent limit prevents slot acquisition."""
++        return False
++
++    def finish_request(self, request: HttpRequest) -> None:
++        """
++        Release the slot held by the current request.
++
++        Removes the oldest matching slot from the slot list for the given
++        client identity. This must be called after the request completes
++        (whether successfully or with an error) to free up the concurrent
++        slot for future requests.
++
++        If the slot list is empty or the client has no active slots, this
++        method is a no-op.
++
++        Args:
++            request: The HTTP request that has completed processing.
++        """
++        cache_key = self.get_cache_key(request)
++        if cache_key is None:
++            return
++
++        now = self._get_current_time()
++        slots = self._load_slots(cache_key)
++        slots = self._cleanup_expired_slots(slots, now)
++
++        # Remove the oldest slot (FIFO release)
++        if slots:
++            slots.pop(0)
++        self._save_slots(cache_key, slots)
++
++    def wait(self) -> Optional[float]:
++        """
++        Estimate how long to wait before a slot becomes available.
++
++        For concurrent throttles, we estimate based on the oldest slot's
++        remaining TTL time. If no slots are active, returns None.
++
++        Returns:
++            Estimated seconds to wait, or None.
++        """
++        if self._last_cache_key is None:
++            return None
++
++        now = self._get_current_time()
++        slots = self._load_slots(self._last_cache_key)
++        slots = self._cleanup_expired_slots(slots, now)
++
++        if not slots:
++            return 0.0
++
++        # The oldest slot will expire first
++        oldest_slot = slots[0]
++        oldest_timestamp = float(oldest_slot.get("timestamp", now))
++        time_until_expiry = self.slot_ttl - (now - oldest_timestamp)
++        return max(0.0, time_until_expiry)
++
++    def get_cache_key(self, request: HttpRequest) -> Optional[str]:
++        """
++        Generate the cache key for concurrent slot tracking.
++
++        Uses the client identity (IP address or user PK) to scope
++        the concurrent limit.
++
++        Args:
++            request: The incoming HTTP request.
++
++        Returns:
++            A cache key string for the client's concurrent slot list.
++        """
++        user = getattr(request, "user", None)
++        if user is not None and getattr(user, "is_authenticated", False):
++            ident = user.pk
++        else:
++            ident = self.get_ident(request)
++
++        if not ident:
++            return None
++
++        return self.cache_format % {"scope": self.scope, "ident": ident}
++
++
++class UserConcurrentThrottle(ConcurrentRateThrottle):
++    """
++    Concurrent request throttle keyed by authenticated user PK.
++
++    For authenticated users, uses the user's pk as the cache key identifier.
++    For anonymous users, falls back to the client IP address.
++
++    This mirrors the cache-key behavior of UserRateThrottle.
++    """
++
++    scope = "concurrent"
++    cache_format = "concurrent_%(scope)s_%(ident)s"
++
++    def get_cache_key(self, request: HttpRequest) -> Optional[str]:
++        """
++        Generate a per-user cache key for concurrent slot tracking.
++
++        Uses user.pk for authenticated users, IP address for anonymous.
++
++        Args:
++            request: The incoming HTTP request.
++
++        Returns:
++            A cache key string uniquely identifying this user's concurrent slots.
++        """
++        user = getattr(request, "user", None)
++        if user is not None and getattr(user, "is_authenticated", False):
++            ident = user.pk
++        else:
++            ident = self.get_ident(request)
++        return self.cache_format % {"scope": self.scope, "ident": ident}
++
++
++class AnonConcurrentThrottle(ConcurrentRateThrottle):
++    """
++    Concurrent request throttle that only applies to anonymous
++    (unauthenticated) requests, keyed by client IP address.
++
++    Returns None for authenticated users, effectively skipping the throttle.
++    This mirrors the cache-key behavior of AnonRateThrottle.
++    """
++
++    scope = "concurrent"
++    cache_format = "concurrent_%(scope)s_%(ident)s"
++
++    def get_cache_key(self, request: HttpRequest) -> Optional[str]:
++        """
++        Generate a cache key for anonymous users only.
++
++        Returns None for authenticated users (no throttling applied).
++        Uses the client IP address for anonymous users.
++
++        Args:
++            request: The incoming HTTP request.
++
++        Returns:
++            A cache key string for anonymous users, or None for authenticated.
++        """
++        user = getattr(request, "user", None)
++        if user is not None and getattr(user, "is_authenticated", False):
++            return None
++        ident = self.get_ident(request)
++        return self.cache_format % {"scope": self.scope, "ident": ident}
+diff --git a/ninja_extra/throttling/signals.py b/ninja_extra/throttling/signals.py
+new file mode 100644
+index 0000000..b1df6cd
+--- /dev/null
++++ b/ninja_extra/throttling/signals.py
+@@ -0,0 +1,15 @@
++"""
++Throttle-specific Django signals.
++
++These signals are dispatched from the _check_throttles method in Operation
++to notify listeners about throttle decisions for each request.
++"""
++from django.dispatch import Signal
++
++# Fired for each throttle that permits a request.
++# Provides: sender (throttle class), request, throttle (instance)
++throttle_request_allowed = Signal()
++
++# Fired for each throttle that denies a request.
++# Provides: sender (throttle class), request, throttle (instance)
++throttle_request_denied = Signal()
