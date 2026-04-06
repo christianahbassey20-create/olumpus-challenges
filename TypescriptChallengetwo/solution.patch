@@ -11,7 +11,7 @@ index 10a775a..d935aad 100644
  
  
 diff --git a/ninja_extra/operation.py b/ninja_extra/operation.py
-index 61376e7..66fd5a2 100644
+index 61376e7..4b68f6d 100644
 --- a/ninja_extra/operation.py
 +++ b/ninja_extra/operation.py
 @@ -189,6 +189,24 @@ class Operation(NinjaOperation):
@@ -39,7 +39,7 @@ index 61376e7..66fd5a2 100644
      def run(self, request: HttpRequest, **kw: Any) -> HttpResponseBase:
          try:
              with self._prep_run(
-@@ -224,12 +242,30 @@ class Operation(NinjaOperation):
+@@ -224,12 +242,32 @@ class Operation(NinjaOperation):
                  msg = f"{e.args[0]}: {msg}" if e.args else msg
                  e.args = (msg,) + e.args[1:]
              return self.api.on_exception(request, e)
@@ -55,11 +55,14 @@ index 61376e7..66fd5a2 100644
          throttle_durations = []
          for throttle in self.throttle_objects:
              if not throttle.allow_request(request):
-                 throttle_durations.append(throttle.wait())
+-                throttle_durations.append(throttle.wait())
++                _wait = throttle.wait()
++                throttle_durations.append(_wait)
 +                throttle_request_denied.send(
 +                    sender=throttle.__class__,
 +                    request=request,
 +                    throttle=throttle,
++                    wait=_wait,
 +                )
 +            else:
 +                throttle_request_allowed.send(
@@ -70,7 +73,7 @@ index 61376e7..66fd5a2 100644
  
          if throttle_durations:
              # Filter out `None` values which may happen in case of config / rate
-@@ -313,6 +349,8 @@ class AsyncOperation(Operation, NinjaAsyncOperation):
+@@ -313,6 +351,8 @@ class AsyncOperation(Operation, NinjaAsyncOperation):
                  return cast(HttpResponseBase, _processed_results)
          except Exception as e:
              return self.api.on_exception(request, e)
@@ -80,10 +83,10 @@ index 61376e7..66fd5a2 100644
  
  class PathView(NinjaPathView):
 diff --git a/ninja_extra/throttling/__init__.py b/ninja_extra/throttling/__init__.py
-index e051c4e..f83799a 100644
+index e051c4e..1cf32a7 100644
 --- a/ninja_extra/throttling/__init__.py
 +++ b/ninja_extra/throttling/__init__.py
-@@ -1,12 +1,20 @@
+@@ -1,12 +1,23 @@
  from ninja.throttling import BaseThrottle
  
 +from .backends import CacheThrottleBackend, ThrottleBackend
@@ -91,20 +94,23 @@ index e051c4e..f83799a 100644
  from .model import (
 +    AnonConcurrentThrottle,
      AnonRateThrottle,
++    AnonSlidingWindowThrottle,
 +    AnonTokenBucketThrottle,
 +    ConcurrentRateThrottle,
      DynamicRateThrottle,
      SimpleRateThrottle,
++    SlidingWindowThrottle,
 +    TokenBucketThrottle,
 +    UserConcurrentThrottle,
      UserRateThrottle,
++    UserSlidingWindowThrottle,
 +    UserTokenBucketThrottle,
  )
 +from .signals import throttle_request_allowed, throttle_request_denied
  
  __all__ = [
      "BaseThrottle",
-@@ -15,4 +23,14 @@ __all__ = [
+@@ -15,4 +26,17 @@ __all__ = [
      "SimpleRateThrottle",
      "AnonRateThrottle",
      "throttle",
@@ -114,6 +120,9 @@ index e051c4e..f83799a 100644
 +    "ConcurrentRateThrottle",
 +    "UserConcurrentThrottle",
 +    "AnonConcurrentThrottle",
++    "SlidingWindowThrottle",
++    "UserSlidingWindowThrottle",
++    "AnonSlidingWindowThrottle",
 +    "ThrottleBackend",
 +    "CacheThrottleBackend",
 +    "throttle_request_allowed",
@@ -246,10 +255,10 @@ index 0000000..54656b0
 +        """
 +        self.cache.delete(key)
 diff --git a/ninja_extra/throttling/model.py b/ninja_extra/throttling/model.py
-index fd44ff9..698b89e 100644
+index fd44ff9..e675edb 100644
 --- a/ninja_extra/throttling/model.py
 +++ b/ninja_extra/throttling/model.py
-@@ -160,3 +160,644 @@ class DynamicRateThrottle(SimpleRateThrottle):
+@@ -160,3 +160,788 @@ class DynamicRateThrottle(SimpleRateThrottle):
              ident = self.get_ident(request)
  
          return self.cache_format % {"scope": self.scope, "ident": ident}
@@ -889,6 +898,150 @@ index fd44ff9..698b89e 100644
 +        Returns:
 +            A cache key string for anonymous users, or None for authenticated.
 +        """
++        user = getattr(request, "user", None)
++        if user is not None and getattr(user, "is_authenticated", False):
++            return None
++        ident = self.get_ident(request)
++        return self.cache_format % {"scope": self.scope, "ident": ident}
++
++
++# ──────────────────────────────────────────────────────────────────────────────
++# Sliding Window Throttle
++# ──────────────────────────────────────────────────────────────────────────────
++
++
++class SlidingWindowThrottle(SimpleRateThrottle):
++    """
++    Sliding-window rate-limiting throttle.
++
++    Tracks individual request timestamps within a rolling window of
++    duration equal to the rate period.  ``allow_request`` counts how
++    many timestamps fall inside ``[now - period, now]``; if the count
++    is less than the capacity the request is allowed and its timestamp
++    is recorded.  ``wait()`` returns the time until the oldest stored
++    timestamp exits the window, freeing a slot.
++
++    State is persisted via a :class:`ThrottleBackend`.
++
++    Cache key format: ``sliding_window_%(scope)s_%(ident)s``
++    """
++
++    cache_format: str = "sliding_window_%(scope)s_%(ident)s"
++    scope: Optional[str] = None
++    _backend: Optional[ThrottleBackend] = None
++    _timestamps: Optional[List[float]] = None
++    _last_cache_key: Optional[str] = None
++
++    def __init__(
++        self,
++        rate: Optional[str] = None,
++        backend: Optional[ThrottleBackend] = None,
++    ) -> None:
++        self._backend = backend if backend is not None else CacheThrottleBackend()
++        self._timestamps = None
++        self._last_cache_key = None
++
++        try:
++            super().__init__(rate)
++        except ImproperlyConfigured:
++            self.rate = None
++            self.num_requests = None
++            self.duration = None
++
++    def _get_current_time(self) -> float:
++        return self.timer()
++
++    def _load_timestamps(self, cache_key: str) -> List[float]:
++        state = self._backend.get_state(cache_key)
++        if state is not None and "timestamps" in state:
++            return [float(t) for t in state["timestamps"]]
++        return []
++
++    def _save_timestamps(
++        self, cache_key: str, timestamps: List[float]
++    ) -> None:
++        state = {"timestamps": timestamps}
++        ttl = (self.duration * 2) if self.duration else 3600
++        self._backend.set_state(cache_key, state, ttl=int(ttl))
++
++    def allow_request(self, request: HttpRequest) -> bool:
++        if self.rate is None:
++            return True
++
++        cache_key = self.get_cache_key(request)
++        if cache_key is None:
++            return True
++
++        self._last_cache_key = cache_key
++        now = self._get_current_time()
++
++        timestamps = self._load_timestamps(cache_key)
++
++        # Discard timestamps outside the window
++        window_start = now - self.duration
++        timestamps = [t for t in timestamps if t > window_start]
++
++        if len(timestamps) >= self.num_requests:
++            self._timestamps = timestamps
++            self._save_timestamps(cache_key, timestamps)
++            return self.throttle_failure()
++
++        timestamps.append(now)
++        timestamps.sort()
++        self._timestamps = timestamps
++        self._save_timestamps(cache_key, timestamps)
++        return self.throttle_success()
++
++    def throttle_success(self) -> bool:
++        return True
++
++    def throttle_failure(self) -> bool:
++        return False
++
++    def wait(self) -> Optional[float]:
++        """
++        Time until the oldest request exits the sliding window,
++        freeing a slot.
++        """
++        if self.rate is None or self._timestamps is None:
++            return None
++        if not self._timestamps or self.duration is None:
++            return None
++
++        now = self._get_current_time()
++        oldest = self._timestamps[0]
++        wait_time = (oldest + self.duration) - now
++        return max(0.0, wait_time)
++
++    def get_cache_key(self, request: HttpRequest) -> Optional[str]:
++        ident = self.get_ident(request)
++        if not ident:
++            return None
++        return self.cache_format % {"scope": self.scope or "default", "ident": ident}
++
++
++class UserSlidingWindowThrottle(SlidingWindowThrottle):
++    """Sliding window keyed by authenticated user PK, falling back to IP."""
++
++    scope = "user"
++    cache_format = "sliding_window_%(scope)s_%(ident)s"
++
++    def get_cache_key(self, request: HttpRequest) -> Optional[str]:
++        user = getattr(request, "user", None)
++        if user is not None and getattr(user, "is_authenticated", False):
++            ident = user.pk
++        else:
++            ident = self.get_ident(request)
++        return self.cache_format % {"scope": self.scope, "ident": ident}
++
++
++class AnonSlidingWindowThrottle(SlidingWindowThrottle):
++    """Sliding window that only applies to anonymous requests."""
++
++    scope = "anon"
++    cache_format = "sliding_window_%(scope)s_%(ident)s"
++
++    def get_cache_key(self, request: HttpRequest) -> Optional[str]:
 +        user = getattr(request, "user", None)
 +        if user is not None and getattr(user, "is_authenticated", False):
 +            return None

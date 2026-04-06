@@ -19,10 +19,10 @@ index 0000000..ce2cb7c
 +fi
 diff --git a/tests/test_throthling/test_advanced_throttling.py b/tests/test_throthling/test_advanced_throttling.py
 new file mode 100644
-index 0000000..61684fb
+index 0000000..9163597
 --- /dev/null
 +++ b/tests/test_throthling/test_advanced_throttling.py
-@@ -0,0 +1,1379 @@
+@@ -0,0 +1,2233 @@
 +import math
 +import uuid
 +from contextlib import contextmanager
@@ -1402,3 +1402,857 @@ index 0000000..61684fb
 +            assert any(r["sender"] == ConcurrentRateThrottle for r in received)
 +        finally:
 +            throttle_request_denied.disconnect(handler)
++
++
++# ──────────────────────────────────────────────
++# SlidingWindowThrottle Tests
++# ──────────────────────────────────────────────
++
++
++class TestSlidingWindowImportAndSubclass:
++    def test_sliding_window_importable_from_throttling(self):
++        from ninja_extra.throttling import SlidingWindowThrottle
++
++        assert SlidingWindowThrottle is not None
++
++    def test_sliding_window_is_subclass_of_simple_rate_throttle(self):
++        from ninja_extra.throttling import SlidingWindowThrottle
++
++        assert issubclass(SlidingWindowThrottle, SimpleRateThrottle)
++
++    def test_sliding_window_accepts_rate_string(self):
++        from ninja_extra.throttling import SlidingWindowThrottle
++
++        class MySW(SlidingWindowThrottle):
++            scope = "test_sw"
++
++            def get_cache_key(self, request):
++                return "sliding_window_test_sw_rate_string"
++
++        throttle = MySW(rate="5/min")
++        request = HttpRequest()
++        request.META["REMOTE_ADDR"] = "80.0.0.1"
++        for _ in range(5):
++            assert throttle.allow_request(request) is True
++        assert throttle.allow_request(request) is False
++
++    def test_sliding_window_construction_no_raise_without_scope(self):
++        from ninja_extra.throttling import SlidingWindowThrottle
++
++        class OrphanSW(SlidingWindowThrottle):
++            scope = "not_in_rates_sw"
++
++            def get_cache_key(self, request):
++                return "orphan_sw"
++
++        throttle = OrphanSW(rate=None)
++        assert throttle is not None
++
++
++class TestSlidingWindowBasicBehavior:
++    def setup_method(self):
++        cache.clear()
++
++    def test_denies_after_capacity_exhausted(self):
++        from ninja_extra.throttling import SlidingWindowThrottle
++
++        class SW(SlidingWindowThrottle):
++            scope = "sw_basic"
++
++            def get_cache_key(self, request):
++                return "sliding_window_sw_basic_" + (self.get_ident(request) or "x")
++
++        throttle = SW(rate="3/min")
++        request = HttpRequest()
++        request.META["REMOTE_ADDR"] = "80.0.0.2"
++
++        for _ in range(3):
++            assert throttle.allow_request(request) is True
++        assert throttle.allow_request(request) is False
++
++    def test_allows_after_window_slides(self):
++        from ninja_extra.throttling import SlidingWindowThrottle
++
++        timer_value = [0.0]
++
++        class TimedSW(SlidingWindowThrottle):
++            scope = "sw_timed"
++
++            def timer(self):
++                return timer_value[0]
++
++            def get_cache_key(self, request):
++                return "sliding_window_sw_timed_slide"
++
++        throttle = TimedSW(rate="3/min")
++        request = HttpRequest()
++        request.META["REMOTE_ADDR"] = "80.0.0.3"
++
++        timer_value[0] = 0.0
++        for _ in range(3):
++            throttle.allow_request(request)
++        assert throttle.allow_request(request) is False
++
++        # Advance past the window: oldest timestamp (0.0) + 60s = 60.0
++        timer_value[0] = 61.0
++        assert throttle.allow_request(request) is True
++
++    def test_partial_window_slide(self):
++        """Only the oldest requests slide out; newer ones remain in the window."""
++        from ninja_extra.throttling import SlidingWindowThrottle
++
++        timer_value = [0.0]
++
++        class TimedSW(SlidingWindowThrottle):
++            scope = "sw_partial"
++
++            def timer(self):
++                return timer_value[0]
++
++            def get_cache_key(self, request):
++                return "sliding_window_sw_partial_slide"
++
++        throttle = TimedSW(rate="3/min")
++        request = HttpRequest()
++        request.META["REMOTE_ADDR"] = "80.0.0.4"
++
++        # Make 3 requests at t=0, t=20, t=40
++        for t in [0.0, 20.0, 40.0]:
++            timer_value[0] = t
++            throttle.allow_request(request)
++
++        # At t=50, window is [0..50), all 3 are within 60s -> denied
++        timer_value[0] = 50.0
++        assert throttle.allow_request(request) is False
++
++        # At t=61, only t=0 has slid out -> 2 in window, 1 slot free -> allowed
++        timer_value[0] = 61.0
++        assert throttle.allow_request(request) is True
++        # Now 3 in window again (t=20, t=40, t=61) -> denied
++        assert throttle.allow_request(request) is False
++
++    def test_different_clients_independent(self):
++        from ninja_extra.throttling import SlidingWindowThrottle
++
++        class SW(SlidingWindowThrottle):
++            scope = "sw_indep"
++
++            def get_cache_key(self, request):
++                return "sliding_window_sw_indep_" + (self.get_ident(request) or "x")
++
++        throttle = SW(rate="2/min")
++        req_a = HttpRequest()
++        req_a.META["REMOTE_ADDR"] = "80.0.0.5"
++        req_b = HttpRequest()
++        req_b.META["REMOTE_ADDR"] = "80.0.0.6"
++
++        throttle.allow_request(req_a)
++        throttle.allow_request(req_a)
++        assert throttle.allow_request(req_a) is False
++        assert throttle.allow_request(req_b) is True
++
++
++class TestSlidingWindowWait:
++    def setup_method(self):
++        cache.clear()
++
++    def test_wait_returns_time_until_oldest_exits(self):
++        from ninja_extra.throttling import SlidingWindowThrottle
++
++        timer_value = [0.0]
++
++        class TimedSW(SlidingWindowThrottle):
++            scope = "sw_wait"
++
++            def timer(self):
++                return timer_value[0]
++
++            def get_cache_key(self, request):
++                return "sliding_window_sw_wait_val"
++
++        throttle = TimedSW(rate="3/min")
++        request = HttpRequest()
++        request.META["REMOTE_ADDR"] = "80.0.0.7"
++
++        # Fill the window at t=0
++        timer_value[0] = 0.0
++        for _ in range(3):
++            throttle.allow_request(request)
++        throttle.allow_request(request)  # denied
++
++        wait_time = throttle.wait()
++        assert wait_time is not None
++        # oldest=0.0, duration=60, now=0.0 -> wait = (0 + 60) - 0 = 60
++        assert abs(wait_time - 60.0) < 0.5
++
++    def test_wait_returns_none_when_rate_is_none(self):
++        from ninja_extra.throttling import SlidingWindowThrottle
++
++        class NullSW(SlidingWindowThrottle):
++            scope = "sw_null_wait"
++
++            def get_cache_key(self, request):
++                return "test"
++
++        throttle = NullSW(rate=None)
++        assert throttle.wait() is None
++
++    def test_allow_request_always_permits_when_rate_is_none(self):
++        from ninja_extra.throttling import SlidingWindowThrottle
++
++        class UnlimitedSW(SlidingWindowThrottle):
++            scope = "sw_unlimited"
++
++            def get_cache_key(self, request):
++                return "sw_unlimited_key"
++
++        throttle = UnlimitedSW(rate=None)
++        request = HttpRequest()
++        request.META["REMOTE_ADDR"] = "80.0.0.8"
++        for _ in range(20):
++            assert throttle.allow_request(request) is True
++
++
++class TestSlidingWindowScopeLookup:
++    def setup_method(self):
++        cache.clear()
++
++    def test_scope_based_rate_lookup(self, monkeypatch):
++        from ninja_extra.throttling import SlidingWindowThrottle
++
++        with monkeypatch.context() as m:
++            m.setattr(
++                settings, "THROTTLE_RATES",
++                {"sw_scope": "4/min", "user": None, "anon": None},
++            )
++
++            class ScopedSW(SlidingWindowThrottle):
++                scope = "sw_scope"
++
++                def get_cache_key(self, request):
++                    return "sliding_window_sw_scope_scoped"
++
++            throttle = ScopedSW()
++            request = HttpRequest()
++            request.META["REMOTE_ADDR"] = "80.0.0.9"
++            for _ in range(4):
++                assert throttle.allow_request(request) is True
++            assert throttle.allow_request(request) is False
++
++    def test_sliding_window_uses_backend(self):
++        from ninja_extra.throttling import (
++            CacheThrottleBackend,
++            SlidingWindowThrottle,
++        )
++
++        class BackendSW(SlidingWindowThrottle):
++            scope = "sw_be"
++
++            def get_cache_key(self, request):
++                return "sliding_window_sw_be_backend"
++
++        backend = CacheThrottleBackend()
++        throttle = BackendSW(rate="3/min", backend=backend)
++        request = HttpRequest()
++        request.META["REMOTE_ADDR"] = "80.0.0.10"
++
++        for _ in range(3):
++            throttle.allow_request(request)
++        assert throttle.allow_request(request) is False
++
++        state = backend.get_state("sliding_window_sw_be_backend")
++        assert state is not None
++        assert "timestamps" in state
++        assert len(state["timestamps"]) == 3
++
++
++# ──────────────────────────────────────────────
++# UserSlidingWindowThrottle and AnonSlidingWindowThrottle Tests
++# ──────────────────────────────────────────────
++
++
++class TestUserSlidingWindowThrottle:
++    def setup_method(self):
++        cache.clear()
++
++    def test_importable(self):
++        from ninja_extra.throttling import UserSlidingWindowThrottle
++
++        assert UserSlidingWindowThrottle is not None
++
++    def test_authenticated_users_get_distinct_keys(self):
++        from ninja_extra.throttling import UserSlidingWindowThrottle
++
++        throttle = UserSlidingWindowThrottle(rate="5/min")
++
++        req_a = HttpRequest()
++        user_a = MockUser("SWUserA")
++        user_a.set_id(301)
++        req_a.user = user_a
++
++        req_b = HttpRequest()
++        user_b = MockUser("SWUserB")
++        user_b.set_id(302)
++        req_b.user = user_b
++
++        key_a = throttle.get_cache_key(req_a)
++        key_b = throttle.get_cache_key(req_b)
++        assert key_a is not None
++        assert key_b is not None
++        assert key_a != key_b
++
++    def test_throttles_per_user(self):
++        from ninja_extra.throttling import UserSlidingWindowThrottle
++
++        throttle = UserSlidingWindowThrottle(rate="2/min")
++
++        user_a = MockUser("SWA")
++        user_a.set_id(uuid.uuid4())
++        req_a = HttpRequest()
++        req_a.user = user_a
++        req_a.META["REMOTE_ADDR"] = "81.0.0.1"
++
++        user_b = MockUser("SWB")
++        user_b.set_id(uuid.uuid4())
++        req_b = HttpRequest()
++        req_b.user = user_b
++        req_b.META["REMOTE_ADDR"] = "81.0.0.1"
++
++        throttle.allow_request(req_a)
++        throttle.allow_request(req_a)
++        assert throttle.allow_request(req_a) is False
++
++        assert throttle.allow_request(req_b) is True
++
++
++class TestAnonSlidingWindowThrottle:
++    def setup_method(self):
++        cache.clear()
++
++    def test_importable(self):
++        from ninja_extra.throttling import AnonSlidingWindowThrottle
++
++        assert AnonSlidingWindowThrottle is not None
++
++    def test_returns_none_for_authenticated(self):
++        from ninja_extra.throttling import AnonSlidingWindowThrottle
++
++        throttle = AnonSlidingWindowThrottle(rate="5/min")
++        req = HttpRequest()
++        user = MockUser("SWAuth")
++        user.set_id(99)
++        req.user = user
++        assert throttle.get_cache_key(req) is None
++
++    def test_anonymous_users_get_distinct_keys(self):
++        from ninja_extra.throttling import AnonSlidingWindowThrottle
++
++        throttle = AnonSlidingWindowThrottle(rate="5/min")
++
++        req_a = HttpRequest()
++        req_a.user = None
++        req_a.META["REMOTE_ADDR"] = "82.0.0.1"
++
++        req_b = HttpRequest()
++        req_b.user = None
++        req_b.META["REMOTE_ADDR"] = "82.0.0.2"
++
++        key_a = throttle.get_cache_key(req_a)
++        key_b = throttle.get_cache_key(req_b)
++        assert key_a is not None
++        assert key_b is not None
++        assert key_a != key_b
++
++    def test_throttles_anonymous_only(self):
++        from ninja_extra.throttling import AnonSlidingWindowThrottle
++
++        throttle = AnonSlidingWindowThrottle(rate="2/min")
++
++        anon_req = HttpRequest()
++        anon_req.user = None
++        anon_req.META["REMOTE_ADDR"] = "82.0.0.3"
++
++        throttle.allow_request(anon_req)
++        throttle.allow_request(anon_req)
++        assert throttle.allow_request(anon_req) is False
++
++        auth_req = HttpRequest()
++        auth_user = MockUser("SWAuthSkip")
++        auth_user.set_id(uuid.uuid4())
++        auth_req.user = auth_user
++        assert throttle.allow_request(auth_req) is True
++
++
++# ──────────────────────────────────────────────
++# Signals with SlidingWindowThrottle
++# ──────────────────────────────────────────────
++
++
++class TestSignalsWithSlidingWindow:
++    def setup_method(self):
++        cache.clear()
++
++    def test_allowed_signal_fires_for_sliding_window(self):
++        from ninja_extra.throttling import (
++            SlidingWindowThrottle,
++            throttle_request_allowed,
++        )
++
++        class SignalSW(SlidingWindowThrottle):
++            scope = "signal_sw"
++            def get_cache_key(self, request):
++                return "sliding_window_signal_sw_" + (self.get_ident(request) or "anon")
++
++        received = []
++        def handler(sender, **kwargs):
++            received.append({"sender": sender, "throttle": kwargs.get("throttle")})
++
++        throttle_request_allowed.connect(handler)
++        try:
++            throttle_inst = SignalSW(rate="10/min")
++            api = NinjaExtraAPI(urls_namespace="sig_sw_%s" % uuid.uuid4().hex[:8])
++
++            @api.get("/sig_sw", throttle=throttle_inst)
++            def sig_sw_view(request):
++                return "ok"
++
++            client = TestClient(api)
++            response = client.get("/sig_sw", META={"REMOTE_ADDR": "83.0.0.1"})
++            assert response.status_code == 200
++            assert any(r["sender"] == SignalSW for r in received)
++        finally:
++            throttle_request_allowed.disconnect(handler)
++
++
++# ──────────────────────────────────────────────
++# Sliding Window Operation Integration
++# ──────────────────────────────────────────────
++
++
++class TestSlidingWindowWithOperation:
++    def setup_method(self):
++        cache.clear()
++
++    def test_operation_throttles_with_sliding_window(self):
++        from ninja_extra.throttling import SlidingWindowThrottle
++
++        class OpSW(SlidingWindowThrottle):
++            scope = "op_sw"
++            def get_cache_key(self, request):
++                return "sliding_window_op_sw_" + (self.get_ident(request) or "anon")
++
++        throttle_inst = OpSW(rate="2/min")
++        api = NinjaExtraAPI(urls_namespace="sw_op_%s" % uuid.uuid4().hex[:8])
++
++        @api.get("/sw_op", throttle=throttle_inst)
++        def sw_op_view(request):
++            return "ok"
++
++        client = TestClient(api)
++        meta = {"REMOTE_ADDR": "84.0.0.1"}
++
++        assert client.get("/sw_op", META=meta).status_code == 200
++        assert client.get("/sw_op", META=meta).status_code == 200
++        assert client.get("/sw_op", META=meta).status_code == 429
++
++    def test_sliding_window_429_has_retry_after_header(self):
++        from ninja_extra.throttling import SlidingWindowThrottle
++
++        class OpSWRetry(SlidingWindowThrottle):
++            scope = "op_sw_retry"
++            def get_cache_key(self, request):
++                return "sliding_window_op_sw_retry_" + (self.get_ident(request) or "anon")
++
++        throttle_inst = OpSWRetry(rate="1/min")
++        api = NinjaExtraAPI(urls_namespace="sw_retry_%s" % uuid.uuid4().hex[:8])
++
++        @api.get("/sw_retry", throttle=throttle_inst)
++        def sw_retry_view(request):
++            return "ok"
++
++        client = TestClient(api)
++        meta = {"REMOTE_ADDR": "84.0.0.2"}
++        client.get("/sw_retry", META=meta)
++        response = client.get("/sw_retry", META=meta)
++        assert response.status_code == 429
++        assert "Retry-After" in response.headers
++
++
++# ──────────────────────────────────────────────
++# Anti-Shortcut Integration Tests
++# ──────────────────────────────────────────────
++
++
++class TestRetryAfterHeader:
++    """Verify that 429 responses include the Retry-After header end-to-end."""
++
++    def setup_method(self):
++        cache.clear()
++
++    def test_token_bucket_429_has_retry_after_header(self):
++        from ninja_extra.throttling import TokenBucketThrottle
++
++        class RetryBucket(TokenBucketThrottle):
++            scope = "retry_tb"
++            def get_cache_key(self, request):
++                return "token_bucket_retry_tb_" + (self.get_ident(request) or "anon")
++
++        throttle_inst = RetryBucket(rate="1/min")
++        api = NinjaExtraAPI(urls_namespace="retry_tb_%s" % uuid.uuid4().hex[:8])
++
++        @api.get("/retry_tb", throttle=throttle_inst)
++        def retry_tb_view(request):
++            return "ok"
++
++        client = TestClient(api)
++        meta = {"REMOTE_ADDR": "85.0.0.1"}
++        client.get("/retry_tb", META=meta)
++        response = client.get("/retry_tb", META=meta)
++        assert response.status_code == 429
++        assert "Retry-After" in response.headers
++
++    def test_concurrent_429_has_retry_after_header(self):
++        from ninja_extra.throttling import ConcurrentRateThrottle
++
++        throttle_inst = ConcurrentRateThrottle(max_concurrent=1)
++        api = NinjaExtraAPI(urls_namespace="retry_conc_%s" % uuid.uuid4().hex[:8])
++
++        @api.get("/retry_conc", throttle=throttle_inst)
++        def retry_conc_view(request):
++            return "ok"
++
++        client = TestClient(api)
++        meta = {"REMOTE_ADDR": "85.0.0.2"}
++        # Pre-exhaust slot
++        request = HttpRequest()
++        request.META["REMOTE_ADDR"] = "85.0.0.2"
++        throttle_inst.allow_request(request)
++        response = client.get("/retry_conc", META=meta)
++        assert response.status_code == 429
++        assert "Retry-After" in response.headers
++
++    def test_retry_after_value_is_integer(self):
++        from ninja_extra.throttling import TokenBucketThrottle
++
++        class RetryIntBucket(TokenBucketThrottle):
++            scope = "retry_int"
++            def get_cache_key(self, request):
++                return "token_bucket_retry_int_" + (self.get_ident(request) or "anon")
++
++        throttle_inst = RetryIntBucket(rate="1/min")
++        api = NinjaExtraAPI(urls_namespace="retry_int_%s" % uuid.uuid4().hex[:8])
++
++        @api.get("/retry_int", throttle=throttle_inst)
++        def retry_int_view(request):
++            return "ok"
++
++        client = TestClient(api)
++        meta = {"REMOTE_ADDR": "85.0.0.3"}
++        client.get("/retry_int", META=meta)
++        response = client.get("/retry_int", META=meta)
++        assert response.status_code == 429
++        retry_after = response.headers.get("Retry-After")
++        assert retry_after is not None
++        # Must be an integer string (no decimals)
++        assert int(retry_after) == int(retry_after)
++
++
++class TestDeniedSignalIncludesWait:
++    """Verify that throttle_request_denied signal includes wait kwarg."""
++
++    def setup_method(self):
++        cache.clear()
++
++    def test_denied_signal_has_wait_kwarg(self):
++        from ninja_extra.throttling import (
++            UserRateThrottle,
++            throttle_request_denied,
++        )
++
++        received = []
++
++        def handler(sender, **kwargs):
++            received.append(kwargs)
++
++        throttle_request_denied.connect(handler)
++        try:
++            user = MockUser("WaitKwargUser")
++            user.set_id(uuid.uuid4())
++
++            api = NinjaExtraAPI(urls_namespace="sig_wait_%s" % uuid.uuid4().hex[:8])
++
++            @api.get("/sig_wait", throttle=UserRateThrottle("1/sec"))
++            def sig_wait_view(request):
++                return "ok"
++
++            client = TestClient(api)
++            client.get("/sig_wait", user=user)
++            try:
++                client.get("/sig_wait", user=user)
++            except Exception:
++                pass
++
++            assert len(received) >= 1
++            # The denied signal must include 'wait' kwarg
++            assert "wait" in received[0]
++            assert received[0]["wait"] is None or isinstance(received[0]["wait"], (int, float))
++        finally:
++            throttle_request_denied.disconnect(handler)
++
++    def test_denied_signal_wait_matches_throttle_wait(self):
++        from ninja_extra.throttling import (
++            TokenBucketThrottle,
++            throttle_request_denied,
++        )
++
++        class WaitMatchBucket(TokenBucketThrottle):
++            scope = "wait_match"
++            def get_cache_key(self, request):
++                return "token_bucket_wait_match_" + (self.get_ident(request) or "anon")
++
++        received = []
++
++        def handler(sender, **kwargs):
++            received.append(kwargs)
++
++        throttle_request_denied.connect(handler)
++        try:
++            throttle_inst = WaitMatchBucket(rate="1/min")
++            api = NinjaExtraAPI(urls_namespace="wait_match_%s" % uuid.uuid4().hex[:8])
++
++            @api.get("/wait_match", throttle=throttle_inst)
++            def wait_match_view(request):
++                return "ok"
++
++            client = TestClient(api)
++            meta = {"REMOTE_ADDR": "86.0.0.1"}
++            client.get("/wait_match", META=meta)
++            client.get("/wait_match", META=meta)
++
++            assert len(received) >= 1
++            # wait value should be a positive number (time until next token)
++            wait_val = received[0]["wait"]
++            assert wait_val is not None
++            assert wait_val > 0
++        finally:
++            throttle_request_denied.disconnect(handler)
++
++
++class TestMixedThrottleTypes:
++    """Verify multiple throttle types work together on a single endpoint."""
++
++    def setup_method(self):
++        cache.clear()
++
++    def test_token_bucket_and_concurrent_together(self):
++        from ninja_extra.throttling import (
++            ConcurrentRateThrottle,
++            TokenBucketThrottle,
++        )
++
++        class MixedBucket(TokenBucketThrottle):
++            scope = "mixed_tb"
++            def get_cache_key(self, request):
++                return "token_bucket_mixed_tb_" + (self.get_ident(request) or "anon")
++
++        tb = MixedBucket(rate="10/min")
++        cr = ConcurrentRateThrottle(max_concurrent=2)
++
++        api = NinjaExtraAPI(urls_namespace="mixed_%s" % uuid.uuid4().hex[:8])
++
++        @api.get("/mixed", throttle=[tb, cr])
++        def mixed_view(request):
++            return "ok"
++
++        client = TestClient(api)
++        meta = {"REMOTE_ADDR": "87.0.0.1"}
++
++        # Should succeed (both allow)
++        response = client.get("/mixed", META=meta)
++        assert response.status_code == 200
++
++    def test_sliding_window_and_concurrent_together(self):
++        from ninja_extra.throttling import (
++            ConcurrentRateThrottle,
++            SlidingWindowThrottle,
++        )
++
++        class MixedSW(SlidingWindowThrottle):
++            scope = "mixed_sw"
++            def get_cache_key(self, request):
++                return "sliding_window_mixed_sw_" + (self.get_ident(request) or "anon")
++
++        sw = MixedSW(rate="10/min")
++        cr = ConcurrentRateThrottle(max_concurrent=2)
++
++        api = NinjaExtraAPI(urls_namespace="mixed_sw_%s" % uuid.uuid4().hex[:8])
++
++        @api.get("/mixed_sw", throttle=[sw, cr])
++        def mixed_sw_view(request):
++            return "ok"
++
++        client = TestClient(api)
++        meta = {"REMOTE_ADDR": "87.0.0.2"}
++
++        response = client.get("/mixed_sw", META=meta)
++        assert response.status_code == 200
++
++    def test_all_three_throttle_types_together(self):
++        from ninja_extra.throttling import (
++            ConcurrentRateThrottle,
++            SlidingWindowThrottle,
++            TokenBucketThrottle,
++        )
++
++        class TriBucket(TokenBucketThrottle):
++            scope = "tri_tb"
++            def get_cache_key(self, request):
++                return "token_bucket_tri_tb_" + (self.get_ident(request) or "anon")
++
++        class TriSW(SlidingWindowThrottle):
++            scope = "tri_sw"
++            def get_cache_key(self, request):
++                return "sliding_window_tri_sw_" + (self.get_ident(request) or "anon")
++
++        tb = TriBucket(rate="10/min")
++        sw = TriSW(rate="10/min")
++        cr = ConcurrentRateThrottle(max_concurrent=5)
++
++        api = NinjaExtraAPI(urls_namespace="tri_%s" % uuid.uuid4().hex[:8])
++
++        @api.get("/tri", throttle=[tb, sw, cr])
++        def tri_view(request):
++            return "ok"
++
++        client = TestClient(api)
++        meta = {"REMOTE_ADDR": "87.0.0.3"}
++
++        for _ in range(3):
++            response = client.get("/tri", META=meta)
++            assert response.status_code == 200
++
++
++class TestCacheKeyIsolation:
++    """Verify that different throttle types produce non-overlapping cache keys."""
++
++    def setup_method(self):
++        cache.clear()
++
++    def test_token_bucket_and_sliding_window_keys_differ(self):
++        from ninja_extra.throttling import SlidingWindowThrottle, TokenBucketThrottle
++
++        class TBKey(TokenBucketThrottle):
++            scope = "shared_scope"
++            def get_cache_key(self, request):
++                ident = self.get_ident(request) or "anon"
++                return self.cache_format % {"scope": self.scope, "ident": ident}
++
++        class SWKey(SlidingWindowThrottle):
++            scope = "shared_scope"
++            def get_cache_key(self, request):
++                ident = self.get_ident(request) or "anon"
++                return self.cache_format % {"scope": self.scope, "ident": ident}
++
++        request = HttpRequest()
++        request.META["REMOTE_ADDR"] = "88.0.0.1"
++
++        tb_key = TBKey(rate="5/min").get_cache_key(request)
++        sw_key = SWKey(rate="5/min").get_cache_key(request)
++
++        assert tb_key is not None
++        assert sw_key is not None
++        # Different throttle types must produce different cache keys
++        assert tb_key != sw_key
++        # Verify format prefixes
++        assert tb_key.startswith("token_bucket_")
++        assert sw_key.startswith("sliding_window_")
++
++    def test_concurrent_and_token_bucket_keys_differ(self):
++        from ninja_extra.throttling import ConcurrentRateThrottle, TokenBucketThrottle
++
++        class TBKey2(TokenBucketThrottle):
++            scope = "iso_scope"
++            def get_cache_key(self, request):
++                ident = self.get_ident(request) or "anon"
++                return self.cache_format % {"scope": self.scope, "ident": ident}
++
++        request = HttpRequest()
++        request.META["REMOTE_ADDR"] = "88.0.0.2"
++
++        tb_key = TBKey2(rate="5/min").get_cache_key(request)
++        cr = ConcurrentRateThrottle(max_concurrent=2)
++        cr_key = cr.get_cache_key(request)
++
++        assert tb_key is not None
++        assert cr_key is not None
++        assert tb_key != cr_key
++        assert cr_key.startswith("concurrent_")
++
++
++class TestBackendStateRoundTrip:
++    """Verify backend state consistency for all throttle types."""
++
++    def setup_method(self):
++        cache.clear()
++
++    def test_token_bucket_state_persists(self):
++        from ninja_extra.throttling import CacheThrottleBackend, TokenBucketThrottle
++
++        class PersistBucket(TokenBucketThrottle):
++            scope = "persist_tb"
++            def get_cache_key(self, request):
++                return "token_bucket_persist_tb_test"
++
++        backend = CacheThrottleBackend()
++        throttle = PersistBucket(rate="5/min", backend=backend)
++        request = HttpRequest()
++        request.META["REMOTE_ADDR"] = "89.0.0.1"
++
++        # Make some requests
++        throttle.allow_request(request)
++        throttle.allow_request(request)
++
++        # Verify state exists in backend
++        state = backend.get_state("token_bucket_persist_tb_test")
++        assert state is not None
++        assert "remaining" in state
++        assert "last_refill" in state
++        assert isinstance(state["remaining"], (int, float))
++
++    def test_sliding_window_state_persists(self):
++        from ninja_extra.throttling import CacheThrottleBackend, SlidingWindowThrottle
++
++        class PersistSW(SlidingWindowThrottle):
++            scope = "persist_sw"
++            def get_cache_key(self, request):
++                return "sliding_window_persist_sw_test"
++
++        backend = CacheThrottleBackend()
++        throttle = PersistSW(rate="5/min", backend=backend)
++        request = HttpRequest()
++        request.META["REMOTE_ADDR"] = "89.0.0.2"
++
++        throttle.allow_request(request)
++        throttle.allow_request(request)
++
++        state = backend.get_state("sliding_window_persist_sw_test")
++        assert state is not None
++        assert "timestamps" in state
++        assert len(state["timestamps"]) == 2
++
++    def test_concurrent_state_persists(self):
++        from ninja_extra.throttling import CacheThrottleBackend, ConcurrentRateThrottle
++
++        backend = CacheThrottleBackend()
++        throttle = ConcurrentRateThrottle(max_concurrent=3, backend=backend)
++        request = HttpRequest()
++        request.META["REMOTE_ADDR"] = "89.0.0.3"
++
++        throttle.allow_request(request)
++        throttle.allow_request(request)
++
++        key = throttle.get_cache_key(request)
++        state = backend.get_state(key)
++        assert state is not None
++        assert "slots" in state
++        assert len(state["slots"]) == 2
