@@ -9,6 +9,7 @@ RUN NODE_ENV=development npm install --legacy-peer-deps --no-optional || \
 
 COPY . .
 
+ENV NODE_ENV=test
 ENV NODE_OPTIONS=--unhandled-rejections=strict
 
 CMD ["/bin/bash"]
