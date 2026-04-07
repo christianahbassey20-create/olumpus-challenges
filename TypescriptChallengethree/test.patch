@@ -3,7 +3,7 @@ new file mode 100644
 index 0000000..9b4f26c
 --- /dev/null
 +++ b/src/FinalForm.computedFields.test.ts
-@@ -0,0 +1,968 @@
+@@ -0,0 +1,1012 @@
 +import createForm from "./FinalForm";
 +
 +const onSubmitMock = jest.fn();
@@ -871,6 +871,50 @@ index 0000000..9b4f26c
 +
 +      unsub();
 +      expect(form.getState().values.doubled).toBeUndefined();
++    });
++
++    it("should not recompute after unsubscribe when former dependencies change", () => {
++      const compute = jest.fn((values) => (values.x || 0) * 2);
++      const form = createForm({
++        onSubmit: onSubmitMock,
++        initialValues: { x: 5 },
++      });
++      form.registerField("x", () => {}, { value: true });
++      const unsub = form.registerComputedField("doubled", {
++        compute,
++        dependsOn: ["x"],
++      });
++      expect(form.getState().values.doubled).toBe(10);
++
++      const countBeforeUnsub = compute.mock.calls.length;
++      unsub();
++
++      // Changing former dependency should NOT trigger the compute function
++      form.change("x", 99);
++      expect(compute.mock.calls.length).toBe(countBeforeUnsub);
++      expect(form.getState().values.doubled).toBeUndefined();
++    });
++
++    it("should not notify former field subscribers after unsubscribe on dependency change", () => {
++      const form = createForm({
++        onSubmit: onSubmitMock,
++        initialValues: { x: 3 },
++      });
++      form.registerField("x", () => {}, { value: true });
++      const unsub = form.registerComputedField("doubled", {
++        compute: (values) => (values.x || 0) * 2,
++        dependsOn: ["x"],
++      });
++
++      const fieldSub = jest.fn();
++      const unsubField = form.registerField("doubled", fieldSub, { value: true });
++      fieldSub.mockClear();
++
++      unsub();
++      // After cleanup, changing the former dependency must not notify the computed field's subscriber
++      form.change("x", 100);
++      expect(fieldSub).not.toHaveBeenCalled();
++      unsubField();
 +    });
 +
 +    it("should handle multiple computed fields depending on the same source", () => {
