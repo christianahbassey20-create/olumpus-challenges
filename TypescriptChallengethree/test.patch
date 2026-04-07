@@ -1021,17 +1021,41 @@ new file mode 100755
 index 0000000..fa2fcd8
 --- /dev/null
 +++ b/test.sh
-@@ -0,0 +1,13 @@
+@@ -0,0 +1,37 @@
 +#!/usr/bin/env bash
 +set -euo pipefail
 +
-+MODE="${1:-new}"
++OUTPUT_PATH=""
++MODE=""
++
++while [[ $# -gt 0 ]]; do
++  case "$1" in
++    --output_path)
++      OUTPUT_PATH="$2"
++      shift 2
++      ;;
++    *)
++      MODE="$1"
++      shift
++      ;;
++  esac
++done
++
++MODE="${MODE:-new}"
++JEST_ARGS=(--no-coverage)
++if [ -n "$OUTPUT_PATH" ]; then
++  JEST_ARGS+=(--reporters=jest-junit)
++  export JEST_JUNIT_OUTPUT_DIR
++  JEST_JUNIT_OUTPUT_DIR="$(dirname "$OUTPUT_PATH")"
++  export JEST_JUNIT_OUTPUT_NAME
++  JEST_JUNIT_OUTPUT_NAME="$(basename "$OUTPUT_PATH")"
++fi
 +
 +if [ "$MODE" = "base" ]; then
-+  npx jest --no-coverage --testPathIgnorePatterns='computedFields'
++  npx jest "${JEST_ARGS[@]}" --testPathIgnorePatterns='computedFields'
 +elif [ "$MODE" = "new" ]; then
-+  npx jest --no-coverage --testPathPattern='computedFields'
++  npx jest "${JEST_ARGS[@]}" --testPathPattern='computedFields'
 +else
-+  echo "Usage: $0 [base|new]" >&2
++  echo "Usage: $0 [--output_path <path>] [base|new]" >&2
 +  exit 1
 +fi

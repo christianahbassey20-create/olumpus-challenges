@@ -3,18 +3,38 @@ new file mode 100755
 index 0000000..9120ca2
 --- /dev/null
 +++ b/test.sh
-@@ -0,0 +1,13 @@
+@@ -0,0 +1,30 @@
 +#!/usr/bin/env bash
 +set -euo pipefail
 +
-+MODE="${1:-new}"
++OUTPUT_PATH=""
++MODE=""
++
++while [[ $# -gt 0 ]]; do
++  case "$1" in
++    --output_path)
++      OUTPUT_PATH="$2"
++      shift 2
++      ;;
++    *)
++      MODE="$1"
++      shift
++      ;;
++  esac
++done
++
++MODE="${MODE:-new}"
++PYTEST_ARGS=(-x --tb=short)
++if [ -n "$OUTPUT_PATH" ]; then
++  PYTEST_ARGS+=(--junitxml="$OUTPUT_PATH")
++fi
 +
 +if [ "$MODE" = "base" ]; then
-+  python -m pytest --ignore=tests/test_model_controller/test_bulk_operations.py -x --tb=short
++  python -m pytest "${PYTEST_ARGS[@]}" --ignore=tests/test_model_controller/test_bulk_operations.py
 +elif [ "$MODE" = "new" ]; then
-+  python -m pytest tests/test_model_controller/test_bulk_operations.py -x --tb=short
++  python -m pytest "${PYTEST_ARGS[@]}" tests/test_model_controller/test_bulk_operations.py
 +else
-+  echo "Usage: $0 [base|new]" >&2
++  echo "Usage: $0 [--output_path <path>] [base|new]" >&2
 +  exit 1
 +fi
 diff --git a/tests/test_model_controller/test_bulk_operations.py b/tests/test_model_controller/test_bulk_operations.py

@@ -9,6 +9,8 @@ RUN NODE_ENV=development npm install --legacy-peer-deps --no-optional || \
 
 COPY . .
 
+RUN NODE_ENV=development npm install --save-dev jest-junit --legacy-peer-deps
+
 ENV NODE_ENV=test
 ENV NODE_OPTIONS=--unhandled-rejections=strict
 
