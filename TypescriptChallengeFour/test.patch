@@ -1104,28 +1104,30 @@ index 0000000..98fc3c7
 +});
 diff --git a/test.sh b/test.sh
 new file mode 100755
-index 0000000..7d91050
+index 0000000..9599cd0
 --- /dev/null
 +++ b/test.sh
-@@ -0,0 +1,39 @@
+@@ -0,0 +1,41 @@
 +#!/usr/bin/env bash
 +set -euo pipefail
 +
-+MODE="${1:-new}"
-+shift || true
-+
 +OUTPUT_PATH=""
++MODE=""
++
 +while [[ $# -gt 0 ]]; do
-+  case $1 in
++  case "$1" in
 +    --output_path)
 +      OUTPUT_PATH="$2"
 +      shift 2
 +      ;;
 +    *)
++      MODE="$1"
 +      shift
 +      ;;
 +  esac
 +done
++
++MODE="${MODE:-new}"
 +
 +JEST_ARGS="--no-coverage --forceExit"
 +
