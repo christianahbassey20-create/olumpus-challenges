@@ -1,9 +1,9 @@
 diff --git a/src/macOS/VoiceOver/navigateTo.test.ts b/src/macOS/VoiceOver/navigateTo.test.ts
 new file mode 100644
-index 0000000..edbb494
+index 0000000..502d201
 --- /dev/null
 +++ b/src/macOS/VoiceOver/navigateTo.test.ts
-@@ -0,0 +1,580 @@
+@@ -0,0 +1,634 @@
 +import {
 +  configureSettings,
 +  DEFAULT_GUIDEPUP_VOICEOVER_SETTINGS,
@@ -211,15 +211,16 @@ index 0000000..edbb494
 +        ]);
 +      });
 +
-+      it("should use cursor.next for forward navigation by default", async () => {
++      it("should match an empty string target against any item", async () => {
 +        VoiceOverCaptionStub.lastSpokenPhrase
 +          .mockResolvedValueOnce("Start")
-+          .mockResolvedValueOnce("Found");
++          .mockResolvedValueOnce("Anything");
 +
-+        await vo.navigateTo("Found");
++        const result = await vo.navigateTo("");
 +
-+        expect(VoiceOverCursorStub.next).toHaveBeenCalled();
-+        expect(VoiceOverCursorStub.previous).not.toHaveBeenCalled();
++        expect(result.found).toBe(true);
++        expect(result.phrase).toBe("Anything");
++        expect(result.steps).toBe(1);
 +      });
 +    });
 +
@@ -236,8 +237,7 @@ index 0000000..edbb494
 +
 +        expect(result.found).toBe(true);
 +        expect(result.steps).toBe(2);
-+        expect(VoiceOverCursorStub.previous).toHaveBeenCalledTimes(2);
-+        expect(VoiceOverCursorStub.next).not.toHaveBeenCalled();
++        expect(result.visited).toStrictEqual(["Prev Item", "Target"]);
 +      });
 +
 +      it("should navigate forward when direction is next", async () => {
@@ -245,9 +245,11 @@ index 0000000..edbb494
 +          .mockResolvedValueOnce("Start")
 +          .mockResolvedValueOnce("Found It");
 +
-+        await vo.navigateTo("Found", { direction: "next" });
++        const result = await vo.navigateTo("Found", { direction: "next" });
 +
-+        expect(VoiceOverCursorStub.next).toHaveBeenCalled();
++        expect(result.found).toBe(true);
++        expect(result.phrase).toBe("Found It");
++        expect(result.steps).toBe(1);
 +      });
 +    });
 +
@@ -385,7 +387,7 @@ index 0000000..edbb494
 +    });
 +
 +    describe("elementType navigation", () => {
-+      it("should navigate by heading element type using keyboard perform", async () => {
++      it("should navigate by heading element type", async () => {
 +        VoiceOverCaptionStub.lastSpokenPhrase
 +          .mockResolvedValueOnce("Start")
 +          .mockResolvedValueOnce("heading level 1, Main Title");
@@ -396,8 +398,7 @@ index 0000000..edbb494
 +
 +        expect(result.found).toBe(true);
 +        expect(result.phrase).toBe("heading level 1, Main Title");
-+        expect(VoiceOverKeyboardStub.perform).toHaveBeenCalled();
-+        expect(VoiceOverCursorStub.next).not.toHaveBeenCalled();
++        expect(result.steps).toBe(1);
 +      });
 +
 +      it("should navigate by link element type", async () => {
@@ -425,7 +426,8 @@ index 0000000..edbb494
 +        });
 +
 +        expect(result.found).toBe(true);
-+        expect(VoiceOverKeyboardStub.perform).toHaveBeenCalled();
++        expect(result.phrase).toBe("heading level 2, Previous Section");
++        expect(result.steps).toBe(1);
 +      });
 +
 +      it("should throw error for unsupported element type containing the type name", async () => {
@@ -525,160 +527,197 @@ index 0000000..edbb494
 +    });
 +
 +    describe("logging parity with next/previous", () => {
-+      it("should call cursor.next once per step so spokenPhraseLog and itemTextLog record each navigation", async () => {
++      it("should record each forward navigation step in spokenPhraseLog", async () => {
++        const spokenLog: string[] = [];
++        const navPhrases = ["Step 1", "Step 2", "Target"];
++        let navIdx = 0;
++
 +        VoiceOverCaptionStub.lastSpokenPhrase
 +          .mockResolvedValueOnce("Start")
 +          .mockResolvedValueOnce("Step 1")
 +          .mockResolvedValueOnce("Step 2")
 +          .mockResolvedValueOnce("Target");
 +
++        VoiceOverCursorStub.next.mockImplementation(async () => {
++          spokenLog.push(navPhrases[navIdx++]);
++        });
++
++        VoiceOverCaptionStub.spokenPhraseLog.mockImplementation(
++          async () => [...spokenLog]
++        );
++
 +        const result = await vo.navigateTo("Target");
 +
-+        expect(result.steps).toBe(3);
-+        // Each step delegates to cursor.next() which internally calls
-+        // logStore.tap(), recording to both spokenPhraseLog and itemTextLog
-+        // identically to individual next() calls.
-+        expect(VoiceOverCursorStub.next).toHaveBeenCalledTimes(3);
++        const log = await VoiceOverCaptionStub.spokenPhraseLog();
++        expect(log).toStrictEqual(["Step 1", "Step 2", "Target"]);
++        expect(log).toStrictEqual(result.visited);
 +      });
 +
-+      it("should call cursor.previous once per step in backward navigation ensuring identical log recording", async () => {
++      it("should record each forward navigation step in itemTextLog", async () => {
++        const itemLog: string[] = [];
++        const navPhrases = ["Step 1", "Step 2", "Target"];
++        let navIdx = 0;
++
 +        VoiceOverCaptionStub.lastSpokenPhrase
 +          .mockResolvedValueOnce("Start")
 +          .mockResolvedValueOnce("Step 1")
-+          .mockResolvedValueOnce("Found");
++          .mockResolvedValueOnce("Step 2")
++          .mockResolvedValueOnce("Target");
 +
-+        const result = await vo.navigateTo("Found", { direction: "previous" });
++        VoiceOverCursorStub.next.mockImplementation(async () => {
++          itemLog.push(navPhrases[navIdx++]);
++        });
 +
-+        expect(result.steps).toBe(2);
-+        // previous() also uses logStore.tap(), so spokenPhraseLog/itemTextLog
-+        // are updated identically to calling previous() individually.
-+        expect(VoiceOverCursorStub.previous).toHaveBeenCalledTimes(2);
++        VoiceOverCaptionStub.itemTextLog.mockImplementation(
++          async () => [...itemLog]
++        );
++
++        const result = await vo.navigateTo("Target");
++
++        const log = await VoiceOverCaptionStub.itemTextLog();
++        expect(log).toStrictEqual(["Step 1", "Step 2", "Target"]);
++        expect(log).toStrictEqual(result.visited);
 +      });
 +
-+      it("should call keyboard.perform once per step for element type navigation ensuring identical log recording", async () => {
++      it("should record backward navigation steps in spokenPhraseLog", async () => {
++        const spokenLog: string[] = [];
++        const navPhrases = ["Prev 1", "Found"];
++        let navIdx = 0;
++
++        VoiceOverCaptionStub.lastSpokenPhrase
++          .mockResolvedValueOnce("Start")
++          .mockResolvedValueOnce("Prev 1")
++          .mockResolvedValueOnce("Found");
++
++        VoiceOverCursorStub.previous.mockImplementation(async () => {
++          spokenLog.push(navPhrases[navIdx++]);
++        });
++
++        VoiceOverCaptionStub.spokenPhraseLog.mockImplementation(
++          async () => [...spokenLog]
++        );
++
++        await vo.navigateTo("Found", { direction: "previous" });
++
++        const log = await VoiceOverCaptionStub.spokenPhraseLog();
++        expect(log).toStrictEqual(["Prev 1", "Found"]);
++      });
++
++      it("should record element type navigation steps in both logs", async () => {
++        const spokenLog: string[] = [];
++        const itemLog: string[] = [];
++        const navPhrases = ["heading A", "heading Found"];
++        let navIdx = 0;
++
 +        VoiceOverCaptionStub.lastSpokenPhrase
 +          .mockResolvedValueOnce("Start")
 +          .mockResolvedValueOnce("heading A")
 +          .mockResolvedValueOnce("heading Found");
 +
-+        const result = await vo.navigateTo("Found", { elementType: "heading" });
++        VoiceOverKeyboardStub.perform.mockImplementation(async () => {
++          spokenLog.push(navPhrases[navIdx]);
++          itemLog.push(navPhrases[navIdx]);
++          navIdx++;
++        });
 +
-+        expect(result.steps).toBe(2);
-+        // keyboard.perform() goes through the same LogStore path,
-+        // so spokenPhraseLog and itemTextLog record these steps.
-+        expect(VoiceOverKeyboardStub.perform).toHaveBeenCalledTimes(2);
-+      });
++        VoiceOverCaptionStub.spokenPhraseLog.mockImplementation(
++          async () => [...spokenLog]
++        );
++        VoiceOverCaptionStub.itemTextLog.mockImplementation(
++          async () => [...itemLog]
++        );
 +
-+      it("should record to itemTextLog when match mode is itemText by using cursor navigation per step", async () => {
-+        VoiceOverCaptionStub.itemText
-+          .mockResolvedValueOnce("Start")
-+          .mockResolvedValueOnce("Item 1")
-+          .mockResolvedValueOnce("Target");
++        await vo.navigateTo("Found", { elementType: "heading" });
 +
-+        const result = await vo.navigateTo("Target", { match: "itemText" });
++        const sLog = await VoiceOverCaptionStub.spokenPhraseLog();
++        expect(sLog).toStrictEqual(["heading A", "heading Found"]);
 +
-+        expect(result.steps).toBe(2);
-+        // cursor.next() is still called, which records to both logs.
-+        expect(VoiceOverCursorStub.next).toHaveBeenCalledTimes(2);
++        const iLog = await VoiceOverCaptionStub.itemTextLog();
++        expect(iLog).toStrictEqual(["heading A", "heading Found"]);
 +      });
 +    });
 +  });
 +});
-diff --git a/src/matchPattern.test.ts b/src/matchPattern.test.ts
+diff --git a/src/navigateToExports.test.ts b/src/navigateToExports.test.ts
 new file mode 100644
-index 0000000..63ffcfe
+index 0000000..1565bed
 --- /dev/null
-+++ b/src/matchPattern.test.ts
-@@ -0,0 +1,83 @@
-+import { matchPattern } from "./matchPattern";
++++ b/src/navigateToExports.test.ts
+@@ -0,0 +1,68 @@
++import type { MatchTarget, NavigateToOptions, NavigateToResult } from "./index";
 +
-+describe("matchPattern", () => {
-+  describe("string target", () => {
-+    it("should match case-insensitive substring", () => {
-+      expect(matchPattern("hello", "Say Hello World")).toBe(true);
-+    });
-+
-+    it("should not match when substring is absent", () => {
-+      expect(matchPattern("xyz", "Hello World")).toBe(false);
-+    });
-+
-+    it("should match with entirely different casing", () => {
-+      expect(matchPattern("HELLO WORLD", "hello world")).toBe(true);
-+    });
-+
-+    it("should match empty string target against any text", () => {
-+      expect(matchPattern("", "anything")).toBe(true);
-+    });
-+
-+    it("should not match non-empty string against empty text", () => {
-+      expect(matchPattern("hello", "")).toBe(false);
-+    });
-+
-+    it("should match partial substring within phrase", () => {
-+      expect(matchPattern("llo Wo", "Hello World")).toBe(true);
-+    });
++describe("package entry point type exports", () => {
++  it("should export NavigateToOptions with direction option", () => {
++    const opts: NavigateToOptions = { direction: "next" };
++    expect(opts.direction).toBe("next");
 +  });
 +
-+  describe("RegExp target", () => {
-+    it("should match when regex matches", () => {
-+      expect(matchPattern(/world$/i, "Hello World")).toBe(true);
-+    });
-+
-+    it("should not match when regex does not match", () => {
-+      expect(matchPattern(/^world/, "Hello World")).toBe(false);
-+    });
-+
-+    it("should support regex flags", () => {
-+      expect(matchPattern(/hello/i, "HELLO")).toBe(true);
-+    });
-+
-+    it("should match regex anchored to full text", () => {
-+      expect(matchPattern(/^Hello World$/, "Hello World")).toBe(true);
-+    });
-+
-+    it("should support alternation in regex", () => {
-+      expect(matchPattern(/(hello)|(world)/i, "say World")).toBe(true);
-+    });
++  it("should export NavigateToOptions with all options", () => {
++    const opts: NavigateToOptions = {
++      direction: "previous",
++      maxSteps: 50,
++      match: "itemText",
++      elementType: "heading",
++    };
++    expect(opts.direction).toBe("previous");
++    expect(opts.maxSteps).toBe(50);
++    expect(opts.match).toBe("itemText");
++    expect(opts.elementType).toBe("heading");
 +  });
 +
-+  describe("predicate target", () => {
-+    it("should return true when predicate returns true", () => {
-+      expect(
-+        matchPattern((text) => text.includes("world"), "hello world")
-+      ).toBe(true);
-+    });
++  it("should export NavigateToOptions with all fields optional", () => {
++    const opts: NavigateToOptions = {};
++    expect(opts).toStrictEqual({});
++  });
 +
-+    it("should return false when predicate returns false", () => {
-+      expect(matchPattern((text) => text.length > 100, "short")).toBe(false);
-+    });
++  it("should export NavigateToResult with expected properties", () => {
++    const result: NavigateToResult = {
++      found: true,
++      phrase: "matched phrase",
++      steps: 3,
++      visited: ["a", "b", "matched phrase"],
++    };
++    expect(result.found).toBe(true);
++    expect(result.phrase).toBe("matched phrase");
++    expect(result.steps).toBe(3);
++    expect(result.visited).toHaveLength(3);
++  });
 +
-+    it("should treat predicate that throws as non-matching", () => {
-+      expect(
-+        matchPattern(() => {
-+          throw new Error("boom");
-+        }, "text")
-+      ).toBe(false);
-+    });
++  it("should export NavigateToResult for not-found case", () => {
++    const result: NavigateToResult = {
++      found: false,
++      phrase: "",
++      steps: 10,
++      visited: ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"],
++    };
++    expect(result.found).toBe(false);
++    expect(result.phrase).toBe("");
++    expect(result.steps).toBe(10);
++  });
 +
-+    it("should support complex predicate logic", () => {
-+      const target = (text: string) =>
-+        text.startsWith("Section") && text.includes("Header");
-+      expect(matchPattern(target, "Section - Main Header")).toBe(true);
-+      expect(matchPattern(target, "Section - Footer")).toBe(false);
-+    });
++  it("should export MatchTarget accepting a string", () => {
++    const target: MatchTarget = "heading";
++    expect(typeof target).toBe("string");
++  });
 +
-+    it("should coerce truthy predicate return to boolean", () => {
-+      expect(matchPattern((() => 1) as unknown as (text: string) => boolean, "text")).toBe(true);
-+      expect(matchPattern((() => 0) as unknown as (text: string) => boolean, "text")).toBe(false);
-+    });
++  it("should export MatchTarget accepting a RegExp", () => {
++    const target: MatchTarget = /heading level \d/i;
++    expect(target).toBeInstanceOf(RegExp);
++  });
++
++  it("should export MatchTarget accepting a predicate function", () => {
++    const target: MatchTarget = (text: string) => text.length > 10;
++    expect(typeof target).toBe("function");
++    expect(target("short")).toBe(false);
++    expect(target("a long enough string")).toBe(true);
 +  });
 +});
 diff --git a/src/windows/NVDA/navigateTo.test.ts b/src/windows/NVDA/navigateTo.test.ts
 new file mode 100644
-index 0000000..2429487
+index 0000000..98fc3c7
 --- /dev/null
 +++ b/src/windows/NVDA/navigateTo.test.ts
-@@ -0,0 +1,403 @@
+@@ -0,0 +1,384 @@
 +import {
 +  ERR_NVDA_NOT_RUNNING,
 +} from "../errors";
@@ -870,15 +909,18 @@ index 0000000..2429487
 +        });
 +
 +        expect(result.found).toBe(true);
-+        expect(NVDAClientStub.sendKeyCode).toHaveBeenCalled();
++        expect(result.phrase).toBe("Previous Target");
++        expect(result.steps).toBe(1);
 +      });
 +
 +      it("should navigate forward by default", async () => {
 +        setUpPhrases(["Start"], ["Next Item"]);
 +
-+        await nvda.navigateTo("Next");
++        const result = await nvda.navigateTo("Next");
 +
-+        expect(NVDAClientStub.sendKeyCode).toHaveBeenCalled();
++        expect(result.found).toBe(true);
++        expect(result.phrase).toBe("Next Item");
++        expect(result.steps).toBe(1);
 +      });
 +    });
 +
@@ -938,6 +980,7 @@ index 0000000..2429487
 +        });
 +
 +        expect(result.found).toBe(true);
++        expect(result.phrase).toBe("heading level 1, Title");
 +      });
 +
 +      it("should navigate by button type (NVDA-specific)", async () => {
@@ -975,6 +1018,7 @@ index 0000000..2429487
 +        });
 +
 +        expect(result.found).toBe(true);
++        expect(result.phrase).toBe("heading level 3, Previous Section");
 +      });
 +
 +      it("should apply cycle detection with element type navigation", async () => {
@@ -1036,46 +1080,22 @@ index 0000000..2429487
 +    });
 +
 +    describe("logging parity with next/previous", () => {
-+      it("should call waitForSpokenPhrase once per step matching next() spokenPhraseLog recording", async () => {
-+        setUpPhrases(["Start"], ["A", "B", "Found"]);
-+
-+        const result = await nvda.navigateTo("Found");
-+
-+        expect(result.steps).toBe(3);
-+        // Each step uses waitForSpokenPhrase which records to spokenPhraseLog
-+        // identically to how individual next() calls record entries.
-+        expect(NVDAClientStub.waitForSpokenPhrase).toHaveBeenCalledTimes(3);
-+      });
-+
-+      it("should invoke sendKeyCode within waitForSpokenPhrase per step ensuring spokenPhraseLog parity", async () => {
-+        setUpPhrases(["Start"], ["A", "Found"]);
-+
-+        await nvda.navigateTo("Found");
-+
-+        // sendKeyCode is called inside the action passed to waitForSpokenPhrase,
-+        // matching the same pattern that next()/previous() use.
-+        expect(NVDAClientStub.sendKeyCode).toHaveBeenCalledTimes(2);
-+        expect(NVDAClientStub.waitForSpokenPhrase).toHaveBeenCalledTimes(2);
-+      });
-+
-+      it("should accumulate spokenPhraseLog entries identically to sequential next() calls", async () => {
++      it("should accumulate spokenPhraseLog entries identically to sequential next calls", async () => {
 +        setUpPhrases(["Start"], ["Step 1", "Step 2", "Target"]);
 +
-+        await nvda.navigateTo("Target");
++        const result = await nvda.navigateTo("Target");
 +
-+        // After navigation, spokenPhraseLog should contain all entries
-+        // as if next() had been called individually for each step.
 +        const log = await NVDAClientStub.spokenPhraseLog();
 +        expect(log).toStrictEqual(["Start", "Step 1", "Step 2", "Target"]);
++        expect(result.visited).toStrictEqual(["Step 1", "Step 2", "Target"]);
 +      });
 +
-+      it("should record spokenPhraseLog entries for backward navigation matching previous() behavior", async () => {
++      it("should accumulate spokenPhraseLog entries for backward navigation", async () => {
 +        setUpPhrases(["Current"], ["Prev 1", "Found"]);
 +
 +        const result = await nvda.navigateTo("Found", { direction: "previous" });
 +
 +        expect(result.steps).toBe(2);
-+        expect(NVDAClientStub.waitForSpokenPhrase).toHaveBeenCalledTimes(2);
 +        const log = await NVDAClientStub.spokenPhraseLog();
 +        expect(log).toStrictEqual(["Current", "Prev 1", "Found"]);
 +      });
@@ -1084,7 +1104,7 @@ index 0000000..2429487
 +});
 diff --git a/test.sh b/test.sh
 new file mode 100755
-index 0000000..616cdf7
+index 0000000..7d91050
 --- /dev/null
 +++ b/test.sh
 @@ -0,0 +1,39 @@
@@ -1119,10 +1139,10 @@ index 0000000..616cdf7
 +
 +if [ "$MODE" = "base" ]; then
 +  npx jest $JEST_ARGS \
-+    --testPathIgnorePatterns="(navigateTo|matchPattern)\\.test\\.ts"
++    --testPathIgnorePatterns="navigateTo"
 +elif [ "$MODE" = "new" ]; then
 +  npx jest $JEST_ARGS \
-+    --testPathPattern="(navigateTo|matchPattern)\\.test\\.ts"
++    --testPathPattern="navigateTo"
 +else
 +  echo "Usage: $0 [base|new] [--output_path <path>]" >&2
 +  exit 1
