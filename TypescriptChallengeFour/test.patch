@@ -1,9 +1,9 @@
 diff --git a/src/macOS/VoiceOver/navigateTo.test.ts b/src/macOS/VoiceOver/navigateTo.test.ts
 new file mode 100644
-index 0000000..96d5fcf
+index 0000000..edbb494
 --- /dev/null
 +++ b/src/macOS/VoiceOver/navigateTo.test.ts
-@@ -0,0 +1,521 @@
+@@ -0,0 +1,580 @@
 +import {
 +  configureSettings,
 +  DEFAULT_GUIDEPUP_VOICEOVER_SETTINGS,
@@ -523,6 +523,65 @@ index 0000000..96d5fcf
 +        expect(result.visited).toStrictEqual(["Found"]);
 +      });
 +    });
++
++    describe("logging parity with next/previous", () => {
++      it("should call cursor.next once per step so spokenPhraseLog and itemTextLog record each navigation", async () => {
++        VoiceOverCaptionStub.lastSpokenPhrase
++          .mockResolvedValueOnce("Start")
++          .mockResolvedValueOnce("Step 1")
++          .mockResolvedValueOnce("Step 2")
++          .mockResolvedValueOnce("Target");
++
++        const result = await vo.navigateTo("Target");
++
++        expect(result.steps).toBe(3);
++        // Each step delegates to cursor.next() which internally calls
++        // logStore.tap(), recording to both spokenPhraseLog and itemTextLog
++        // identically to individual next() calls.
++        expect(VoiceOverCursorStub.next).toHaveBeenCalledTimes(3);
++      });
++
++      it("should call cursor.previous once per step in backward navigation ensuring identical log recording", async () => {
++        VoiceOverCaptionStub.lastSpokenPhrase
++          .mockResolvedValueOnce("Start")
++          .mockResolvedValueOnce("Step 1")
++          .mockResolvedValueOnce("Found");
++
++        const result = await vo.navigateTo("Found", { direction: "previous" });
++
++        expect(result.steps).toBe(2);
++        // previous() also uses logStore.tap(), so spokenPhraseLog/itemTextLog
++        // are updated identically to calling previous() individually.
++        expect(VoiceOverCursorStub.previous).toHaveBeenCalledTimes(2);
++      });
++
++      it("should call keyboard.perform once per step for element type navigation ensuring identical log recording", async () => {
++        VoiceOverCaptionStub.lastSpokenPhrase
++          .mockResolvedValueOnce("Start")
++          .mockResolvedValueOnce("heading A")
++          .mockResolvedValueOnce("heading Found");
++
++        const result = await vo.navigateTo("Found", { elementType: "heading" });
++
++        expect(result.steps).toBe(2);
++        // keyboard.perform() goes through the same LogStore path,
++        // so spokenPhraseLog and itemTextLog record these steps.
++        expect(VoiceOverKeyboardStub.perform).toHaveBeenCalledTimes(2);
++      });
++
++      it("should record to itemTextLog when match mode is itemText by using cursor navigation per step", async () => {
++        VoiceOverCaptionStub.itemText
++          .mockResolvedValueOnce("Start")
++          .mockResolvedValueOnce("Item 1")
++          .mockResolvedValueOnce("Target");
++
++        const result = await vo.navigateTo("Target", { match: "itemText" });
++
++        expect(result.steps).toBe(2);
++        // cursor.next() is still called, which records to both logs.
++        expect(VoiceOverCursorStub.next).toHaveBeenCalledTimes(2);
++      });
++    });
 +  });
 +});
 diff --git a/src/matchPattern.test.ts b/src/matchPattern.test.ts
@@ -616,10 +675,10 @@ index 0000000..63ffcfe
 +});
 diff --git a/src/windows/NVDA/navigateTo.test.ts b/src/windows/NVDA/navigateTo.test.ts
 new file mode 100644
-index 0000000..fcad7fd
+index 0000000..2429487
 --- /dev/null
 +++ b/src/windows/NVDA/navigateTo.test.ts
-@@ -0,0 +1,357 @@
+@@ -0,0 +1,403 @@
 +import {
 +  ERR_NVDA_NOT_RUNNING,
 +} from "../errors";
@@ -975,11 +1034,57 @@ index 0000000..fcad7fd
 +        expect(result.visited).toStrictEqual(["Found"]);
 +      });
 +    });
++
++    describe("logging parity with next/previous", () => {
++      it("should call waitForSpokenPhrase once per step matching next() spokenPhraseLog recording", async () => {
++        setUpPhrases(["Start"], ["A", "B", "Found"]);
++
++        const result = await nvda.navigateTo("Found");
++
++        expect(result.steps).toBe(3);
++        // Each step uses waitForSpokenPhrase which records to spokenPhraseLog
++        // identically to how individual next() calls record entries.
++        expect(NVDAClientStub.waitForSpokenPhrase).toHaveBeenCalledTimes(3);
++      });
++
++      it("should invoke sendKeyCode within waitForSpokenPhrase per step ensuring spokenPhraseLog parity", async () => {
++        setUpPhrases(["Start"], ["A", "Found"]);
++
++        await nvda.navigateTo("Found");
++
++        // sendKeyCode is called inside the action passed to waitForSpokenPhrase,
++        // matching the same pattern that next()/previous() use.
++        expect(NVDAClientStub.sendKeyCode).toHaveBeenCalledTimes(2);
++        expect(NVDAClientStub.waitForSpokenPhrase).toHaveBeenCalledTimes(2);
++      });
++
++      it("should accumulate spokenPhraseLog entries identically to sequential next() calls", async () => {
++        setUpPhrases(["Start"], ["Step 1", "Step 2", "Target"]);
++
++        await nvda.navigateTo("Target");
++
++        // After navigation, spokenPhraseLog should contain all entries
++        // as if next() had been called individually for each step.
++        const log = await NVDAClientStub.spokenPhraseLog();
++        expect(log).toStrictEqual(["Start", "Step 1", "Step 2", "Target"]);
++      });
++
++      it("should record spokenPhraseLog entries for backward navigation matching previous() behavior", async () => {
++        setUpPhrases(["Current"], ["Prev 1", "Found"]);
++
++        const result = await nvda.navigateTo("Found", { direction: "previous" });
++
++        expect(result.steps).toBe(2);
++        expect(NVDAClientStub.waitForSpokenPhrase).toHaveBeenCalledTimes(2);
++        const log = await NVDAClientStub.spokenPhraseLog();
++        expect(log).toStrictEqual(["Current", "Prev 1", "Found"]);
++      });
++    });
 +  });
 +});
 diff --git a/test.sh b/test.sh
 new file mode 100755
-index 0000000..398e14a
+index 0000000..616cdf7
 --- /dev/null
 +++ b/test.sh
 @@ -0,0 +1,39 @@
