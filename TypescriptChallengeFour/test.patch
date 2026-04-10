@@ -979,10 +979,10 @@ index 0000000..fcad7fd
 +});
 diff --git a/test.sh b/test.sh
 new file mode 100755
-index 0000000..e71f940
+index 0000000..398e14a
 --- /dev/null
 +++ b/test.sh
-@@ -0,0 +1,41 @@
+@@ -0,0 +1,40 @@
 +#!/usr/bin/env bash
 +set -euo pipefail
 +
@@ -1005,7 +1005,6 @@ index 0000000..e71f940
 +JEST_ARGS="--no-coverage --forceExit"
 +
 +if [ -n "$OUTPUT_PATH" ]; then
-+  npm install --save-dev jest-junit 2>/dev/null || true
 +  JEST_JUNIT_OUTPUT_DIR="$(dirname "$OUTPUT_PATH")"
 +  JEST_JUNIT_OUTPUT_NAME="$(basename "$OUTPUT_PATH")"
 +  export JEST_JUNIT_OUTPUT_DIR
