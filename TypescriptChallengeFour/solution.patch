@@ -1,0 +1,652 @@
+diff --git a/src/NavigateToOptions.ts b/src/NavigateToOptions.ts
+new file mode 100644
+index 0000000..b8d2a48
+--- /dev/null
++++ b/src/NavigateToOptions.ts
+@@ -0,0 +1,35 @@
++import type { CommandOptions } from "./CommandOptions";
++
++/**
++ * Options for the `navigateTo` method on screen readers.
++ */
++export interface NavigateToOptions extends CommandOptions {
++  /**
++   * Direction to navigate. Default is `"next"`.
++   */
++  direction?: "next" | "previous";
++
++  /**
++   * Maximum number of navigation steps before giving up. Default is `100`.
++   */
++  maxSteps?: number;
++
++  /**
++   * Which text to compare against the target pattern.
++   *
++   * - `"spokenPhrase"` (default): compare against the spoken phrase.
++   * - `"itemText"`: compare against the item text.
++   */
++  match?: "spokenPhrase" | "itemText";
++
++  /**
++   * Navigate by element kind using the platform's native element navigation
++   * commands. Examples: `"heading"`, `"link"`, `"table"`, `"list"`,
++   * `"graphic"`.
++   *
++   * When not specified, generic next/previous navigation is used.
++   *
++   * Unsupported element types will throw an error.
++   */
++  elementType?: string;
++}
+diff --git a/src/NavigateToResult.ts b/src/NavigateToResult.ts
+new file mode 100644
+index 0000000..b2327ef
+--- /dev/null
++++ b/src/NavigateToResult.ts
+@@ -0,0 +1,24 @@
++/**
++ * Result of a `navigateTo` operation.
++ */
++export interface NavigateToResult {
++  /**
++   * Whether a matching item was found.
++   */
++  found: boolean;
++
++  /**
++   * The matched phrase text, or an empty string if no match was found.
++   */
++  phrase: string;
++
++  /**
++   * The number of navigation steps performed.
++   */
++  steps: number;
++
++  /**
++   * All phrases encountered during navigation, in order.
++   */
++  visited: string[];
++}
+diff --git a/src/ScreenReader.ts b/src/ScreenReader.ts
+index 01da825..890bdd3 100644
+--- a/src/ScreenReader.ts
++++ b/src/ScreenReader.ts
+@@ -1,6 +1,9 @@
+ import { ClickOptions } from "./ClickOptions";
+ import type { CommandOptions } from "./CommandOptions";
+ import type { KeyboardOptions } from "./KeyboardOptions";
++import type { MatchTarget } from "./matchPattern";
++import type { NavigateToOptions } from "./NavigateToOptions";
++import type { NavigateToResult } from "./NavigateToResult";
+ 
+ export interface ScreenReader {
+   /**
+@@ -162,4 +165,17 @@ export interface ScreenReader {
+    * Clear the log of all visited item text for this screen reader instance.
+    */
+   clearItemTextLog(): Promise<void>;
++
++  /**
++   * Navigate through items until finding one whose spoken phrase or item text
++   * matches the target pattern.
++   *
++   * @param {MatchTarget} target String, RegExp, or predicate to match against.
++   * @param {NavigateToOptions} [options] Navigation options.
++   * @returns {Promise<NavigateToResult>} The navigation result.
++   */
++  navigateTo(
++    target: MatchTarget,
++    options?: NavigateToOptions
++  ): Promise<NavigateToResult>;
+ }
+diff --git a/src/index.ts b/src/index.ts
+index eec1d0f..f3106a4 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -6,4 +6,7 @@ export type { KeyboardCommand } from "./KeyboardCommand";
+ export type { KeyboardOptions } from "./KeyboardOptions";
+ export type { KeyCodeCommand } from "./KeyCodeCommand";
+ export type { KeystrokeCommand } from "./KeystrokeCommand";
++export type { MatchTarget } from "./matchPattern";
++export type { NavigateToOptions } from "./NavigateToOptions";
++export type { NavigateToResult } from "./NavigateToResult";
+ export type { ScreenReader } from "./ScreenReader";
+diff --git a/src/macOS/VoiceOver/VoiceOver.ts b/src/macOS/VoiceOver/VoiceOver.ts
+index d50c3c4..c75f173 100644
+--- a/src/macOS/VoiceOver/VoiceOver.ts
++++ b/src/macOS/VoiceOver/VoiceOver.ts
+@@ -11,11 +11,15 @@ import {
+ import { ClickOptions } from "../../ClickOptions";
+ import { CommanderCommands } from "./CommanderCommands";
+ import type { CommandOptions } from "../../CommandOptions";
++import { getVoiceOverNavigationCommand } from "./elementNavigationCommands";
+ import { isKeyboard } from "../../isKeyboard";
+ import { isMacOS } from "../isMacOS";
+ import { KeyboardCommand } from "../KeyboardCommand";
+ import { KeyboardOptions } from "../../KeyboardOptions";
+ import { LogStore } from "./LogStore";
++import { matchPattern, MatchTarget } from "../../matchPattern";
++import type { NavigateToOptions } from "../../NavigateToOptions";
++import type { NavigateToResult } from "../../NavigateToResult";
+ import type { Prettify } from "../../typeHelpers";
+ import type { ScreenReader } from "../../ScreenReader";
+ import { start } from "./start";
+@@ -933,4 +937,97 @@ export class VoiceOver implements ScreenReader {
+ 
+     await this.#caption.clearItemTextLog();
+   }
++
++  /**
++   * [API Reference](https://www.guidepup.dev/docs/api/class-voiceover#voiceover-navigate-to)
++   *
++   * Navigate through items until finding one whose spoken phrase or item text
++   * matches the target pattern.
++   *
++   * ```ts
++   * import { voiceOver } from "@guidepup/guidepup";
++   *
++   * (async () => {
++   *   // Start VoiceOver.
++   *   await voiceOver.start();
++   *
++   *   // Navigate to the next heading containing "Main".
++   *   const result = await voiceOver.navigateTo("Main", {
++   *     elementType: "heading",
++   *   });
++   *
++   *   console.log(result.found);   // true
++   *   console.log(result.phrase);  // "heading level 1, Main Title"
++   *   console.log(result.steps);   // 2
++   *   console.log(result.visited); // ["heading level 2, Nav", "heading level 1, Main Title"]
++   *
++   *   // Stop VoiceOver.
++   *   await voiceOver.stop();
++   * })();
++   * ```
++   *
++   * @param {MatchTarget} target String (case-insensitive substring), RegExp,
++   *   or predicate function to match against.
++   * @param {NavigateToOptions} [options] Additional navigation options.
++   * @returns {Promise<NavigateToResult>} The navigation result.
++   */
++  async navigateTo(
++    target: MatchTarget,
++    options?: NavigateToOptions
++  ): Promise<NavigateToResult> {
++    if (!this.#started) {
++      throw new Error(ERR_VOICE_OVER_NOT_RUNNING);
++    }
++
++    const direction = options?.direction ?? "next";
++    const maxSteps = options?.maxSteps ?? 100;
++    const matchMode = options?.match ?? "spokenPhrase";
++    const elementType = options?.elementType;
++
++    if (elementType) {
++      const command = getVoiceOverNavigationCommand(elementType, direction);
++
++      if (!command) {
++        throw new Error(
++          `Unsupported element type for VoiceOver: ${elementType}`
++        );
++      }
++    }
++
++    const initialPhrase =
++      matchMode === "itemText"
++        ? await this.#caption.itemText()
++        : await this.#caption.lastSpokenPhrase();
++
++    const visited: string[] = [];
++
++    for (let step = 0; step < maxSteps; step++) {
++      if (elementType) {
++        const command = getVoiceOverNavigationCommand(elementType, direction);
++
++        await this.#keyboard.perform(command, options);
++      } else if (direction === "previous") {
++        await this.#cursor.previous(options);
++      } else {
++        await this.#cursor.next(options);
++      }
++
++      const phrase =
++        matchMode === "itemText"
++          ? await this.#caption.itemText()
++          : await this.#caption.lastSpokenPhrase();
++
++      visited.push(phrase);
++
++      if (matchPattern(target, phrase)) {
++        return { found: true, phrase, steps: step + 1, visited };
++      }
++
++      if (phrase === initialPhrase) {
++        return { found: false, phrase: "", steps: step + 1, visited };
++      }
++    }
++
++    return { found: false, phrase: "", steps: maxSteps, visited };
++  }
+ }
+diff --git a/src/macOS/VoiceOver/elementNavigationCommands.ts b/src/macOS/VoiceOver/elementNavigationCommands.ts
+new file mode 100644
+index 0000000..cc16e00
+--- /dev/null
++++ b/src/macOS/VoiceOver/elementNavigationCommands.ts
+@@ -0,0 +1,103 @@
++import { keyCodeCommands } from "./keyCodeCommands";
++import type { KeyCodeCommand } from "../KeyCodeCommand";
++
++type NavigationPair = {
++  next: KeyCodeCommand;
++  previous: KeyCodeCommand;
++};
++
++const elementCommands: Record<string, NavigationPair> = {
++  heading: {
++    next: keyCodeCommands.findNextHeading,
++    previous: keyCodeCommands.findPreviousHeading,
++  },
++  link: {
++    next: keyCodeCommands.findNextLink,
++    previous: keyCodeCommands.findPreviousLink,
++  },
++  table: {
++    next: keyCodeCommands.findNextTable,
++    previous: keyCodeCommands.findPreviousTable,
++  },
++  list: {
++    next: keyCodeCommands.findNextList,
++    previous: keyCodeCommands.findPreviousList,
++  },
++  graphic: {
++    next: keyCodeCommands.findNextGraphic,
++    previous: keyCodeCommands.findPreviousGraphic,
++  },
++  visitedLink: {
++    next: keyCodeCommands.findNextVisitedLink,
++    previous: keyCodeCommands.findPreviousVisitedLink,
++  },
++  control: {
++    next: keyCodeCommands.findNextControl,
++    previous: keyCodeCommands.findPreviousControl,
++  },
++  boldText: {
++    next: keyCodeCommands.findNextBoldText,
++    previous: keyCodeCommands.findPreviousBoldText,
++  },
++  italicText: {
++    next: keyCodeCommands.findNextItalicText,
++    previous: keyCodeCommands.findPreviousItalicText,
++  },
++  underlinedText: {
++    next: keyCodeCommands.findNextUnderlinedText,
++    previous: keyCodeCommands.findPreviousUnderlinedText,
++  },
++  plainText: {
++    next: keyCodeCommands.findNextPlainText,
++    previous: keyCodeCommands.findPreviousPlainText,
++  },
++  styleChange: {
++    next: keyCodeCommands.findNextStyleChange,
++    previous: keyCodeCommands.findPreviousStyleChange,
++  },
++  colorChange: {
++    next: keyCodeCommands.findNextColorChange,
++    previous: keyCodeCommands.findPreviousColorChange,
++  },
++  fontChange: {
++    next: keyCodeCommands.findNextFontChange,
++    previous: keyCodeCommands.findPreviousFontChange,
++  },
++  misspelledWord: {
++    next: keyCodeCommands.findNextMisspelledWord,
++    previous: keyCodeCommands.findPreviousMisspelledWord,
++  },
++  headingOfSameLevel: {
++    next: keyCodeCommands.findNextHeadingOfSameLevel,
++    previous: keyCodeCommands.findPreviousHeadingOfSameLevel,
++  },
++  differentItem: {
++    next: keyCodeCommands.findNextDifferentItem,
++    previous: keyCodeCommands.findPreviousDifferentItem,
++  },
++  sameTypeItem: {
++    next: keyCodeCommands.findNextItemWithSameTypeAsCurrentItem,
++    previous: keyCodeCommands.findPreviousItemWithSameTypeAsCurrentItem,
++  },
++};
++
++/**
++ * Get the VoiceOver keyboard command for navigating to the next or previous
++ * element of the specified type.
++ *
++ * @param elementType The element type to navigate by.
++ * @param direction   The navigation direction.
++ * @returns The keyboard command, or `null` if the element type is not supported.
++ */
++export function getVoiceOverNavigationCommand(
++  elementType: string,
++  direction: "next" | "previous"
++): KeyCodeCommand | null {
++  const pair = elementCommands[elementType];
++
++  if (!pair) {
++    return null;
++  }
++
++  return pair[direction];
++}
+diff --git a/src/matchPattern.ts b/src/matchPattern.ts
+new file mode 100644
+index 0000000..ffaae22
+--- /dev/null
++++ b/src/matchPattern.ts
+@@ -0,0 +1,44 @@
++/**
++ * Target for pattern matching in navigation operations.
++ *
++ * - `string`: case-insensitive substring matching
++ * - `RegExp`: regular expression matching
++ * - `function`: predicate receiving phrase text, returning boolean
++ */
++export type MatchTarget = string | RegExp | ((text: string) => boolean);
++
++/**
++ * Test whether `text` matches the given `target` pattern.
++ *
++ * - **string** targets use case-insensitive substring matching.
++ * - **RegExp** targets test the full text against the pattern.
++ * - **function** targets receive the text and must return a boolean;
++ *   predicates that throw are treated as non-matching.
++ *
++ * @param target The match target.
++ * @param text   The text to test.
++ * @returns Whether the text matches the target.
++ */
++export function matchPattern(target: MatchTarget, text: string): boolean {
++  if (typeof target === "string") {
++    if (target === "") {
++      return true;
++    }
++
++    return text.toLowerCase().includes(target.toLowerCase());
++  }
++
++  if (target instanceof RegExp) {
++    return target.test(text);
++  }
++
++  if (typeof target === "function") {
++    try {
++      return Boolean(target(text));
++    } catch {
++      return false;
++    }
++  }
++
++  return false;
++}
+diff --git a/src/windows/NVDA/NVDA.ts b/src/windows/NVDA/NVDA.ts
+index 0a63869..9681e1f 100644
+--- a/src/windows/NVDA/NVDA.ts
++++ b/src/windows/NVDA/NVDA.ts
+@@ -5,12 +5,16 @@ import {
+ } from "../errors";
+ import type { ClickOptions } from "../../ClickOptions";
+ import { CommandOptions } from "../../CommandOptions";
++import { getNVDANavigationCommand } from "./elementNavigationCommands";
+ import { isNVDAInstalled } from "./isNVDAInstalled";
+ import { isWindows } from "../isWindows";
+ import type { KeyCodeCommand } from "../KeyCodeCommand";
+ import { keyCodeCommands } from "./keyCodeCommands";
+ import { KeyCodes } from "../KeyCodes";
++import { matchPattern, MatchTarget } from "../../matchPattern";
+ import { Modifiers } from "../Modifiers";
++import type { NavigateToOptions } from "../../NavigateToOptions";
++import type { NavigateToResult } from "../../NavigateToResult";
+ import { NVDAClient } from "./NVDAClient";
+ import { parseKey } from "../../parseKey";
+ import type { Prettify } from "../../typeHelpers";
+@@ -669,4 +673,89 @@ export class NVDA implements ScreenReader {
+ 
+     await this.#client.clearSpokenPhraseLog();
+   }
++
++  /**
++   * Navigate through items until finding one whose spoken phrase matches
++   * the target pattern.
++   *
++   * ```ts
++   * import { nvda } from "@guidepup/guidepup";
++   *
++   * (async () => {
++   *   // Start NVDA.
++   *   await nvda.start();
++   *
++   *   // Navigate to the next heading containing "Main".
++   *   const result = await nvda.navigateTo("Main", {
++   *     elementType: "heading",
++   *   });
++   *
++   *   console.log(result.found);   // true
++   *   console.log(result.phrase);  // "heading level 1, Main Title"
++   *   console.log(result.steps);   // 2
++   *   console.log(result.visited); // ["Nav", "heading level 1, Main Title"]
++   *
++   *   // Stop NVDA.
++   *   await nvda.stop();
++   * })();
++   * ```
++   *
++   * @param {MatchTarget} target String (case-insensitive substring), RegExp,
++   *   or predicate function to match against.
++   * @param {NavigateToOptions} [options] Additional navigation options.
++   * @returns {Promise<NavigateToResult>} The navigation result.
++   */
++  async navigateTo(
++    target: MatchTarget,
++    options?: NavigateToOptions
++  ): Promise<NavigateToResult> {
++    if (!this.#started) {
++      throw new Error(ERR_NVDA_NOT_RUNNING);
++    }
++
++    const direction = options?.direction ?? "next";
++    const maxSteps = options?.maxSteps ?? 100;
++    const elementType = options?.elementType;
++
++    let navigationKeyCommand: KeyCodeCommand;
++
++    if (elementType) {
++      const command = getNVDANavigationCommand(elementType, direction);
++
++      if (!command) {
++        throw new Error(`Unsupported element type for NVDA: ${elementType}`);
++      }
++
++      navigationKeyCommand = command;
++    } else {
++      navigationKeyCommand =
++        direction === "previous"
++          ? keyCodeCommands.moveToPrevious
++          : keyCodeCommands.moveToNext;
++    }
++
++    const initialPhrase = await this.lastSpokenPhrase();
++    const visited: string[] = [];
++
++    for (let step = 0; step < maxSteps; step++) {
++      await this.#client.waitForSpokenPhrase(
++        () => this.#client.sendKeyCode(navigationKeyCommand),
++        options
++      );
++
++      const phrase = await this.lastSpokenPhrase();
++
++      visited.push(phrase);
++
++      if (matchPattern(target, phrase)) {
++        return { found: true, phrase, steps: step + 1, visited };
++      }
++
++      if (phrase === initialPhrase) {
++        return { found: false, phrase: "", steps: step + 1, visited };
++      }
++    }
++
++    return { found: false, phrase: "", steps: maxSteps, visited };
++  }
+ }
+diff --git a/src/windows/NVDA/elementNavigationCommands.ts b/src/windows/NVDA/elementNavigationCommands.ts
+new file mode 100644
+index 0000000..66825ba
+--- /dev/null
++++ b/src/windows/NVDA/elementNavigationCommands.ts
+@@ -0,0 +1,143 @@
++import { keyCodeCommands } from "./keyCodeCommands";
++import type { KeyCodeCommand } from "../KeyCodeCommand";
++
++type NavigationPair = {
++  next: KeyCodeCommand;
++  previous: KeyCodeCommand;
++};
++
++const elementCommands: Record<string, NavigationPair> = {
++  heading: {
++    next: keyCodeCommands.moveToNextHeading,
++    previous: keyCodeCommands.moveToPreviousHeading,
++  },
++  link: {
++    next: keyCodeCommands.moveToNextLink,
++    previous: keyCodeCommands.moveToPreviousLink,
++  },
++  table: {
++    next: keyCodeCommands.moveToNextTable,
++    previous: keyCodeCommands.moveToPreviousTable,
++  },
++  list: {
++    next: keyCodeCommands.moveToNextList,
++    previous: keyCodeCommands.moveToPreviousList,
++  },
++  graphic: {
++    next: keyCodeCommands.moveToNextGraphic,
++    previous: keyCodeCommands.moveToPreviousGraphic,
++  },
++  visitedLink: {
++    next: keyCodeCommands.moveToNextVisitedLink,
++    previous: keyCodeCommands.moveToPreviousVisitedLink,
++  },
++  button: {
++    next: keyCodeCommands.moveToNextButton,
++    previous: keyCodeCommands.moveToPreviousButton,
++  },
++  checkbox: {
++    next: keyCodeCommands.moveToNextCheckbox,
++    previous: keyCodeCommands.moveToPreviousCheckbox,
++  },
++  radioButton: {
++    next: keyCodeCommands.moveToNextRadioButton,
++    previous: keyCodeCommands.moveToPreviousRadioButton,
++  },
++  comboBox: {
++    next: keyCodeCommands.moveToNextComboBox,
++    previous: keyCodeCommands.moveToPreviousComboBox,
++  },
++  editField: {
++    next: keyCodeCommands.moveToNextEditField,
++    previous: keyCodeCommands.moveToPreviousEditField,
++  },
++  formField: {
++    next: keyCodeCommands.moveToNextFormField,
++    previous: keyCodeCommands.moveToPreviousFormField,
++  },
++  landmark: {
++    next: keyCodeCommands.moveToNextLandmark,
++    previous: keyCodeCommands.moveToPreviousLandmark,
++  },
++  blockQuote: {
++    next: keyCodeCommands.moveToNextBlockQuote,
++    previous: keyCodeCommands.moveToPreviousBlockQuote,
++  },
++  separator: {
++    next: keyCodeCommands.moveToNextSeparator,
++    previous: keyCodeCommands.moveToPreviousSeparator,
++  },
++  frame: {
++    next: keyCodeCommands.moveToNextFrame,
++    previous: keyCodeCommands.moveToPreviousFrame,
++  },
++  embeddedObject: {
++    next: keyCodeCommands.moveToNextEmbeddedObject,
++    previous: keyCodeCommands.moveToPreviousEmbeddedObject,
++  },
++  annotation: {
++    next: keyCodeCommands.moveToNextAnnotation,
++    previous: keyCodeCommands.moveToPreviousAnnotation,
++  },
++  spellingError: {
++    next: keyCodeCommands.moveToNextSpellingError,
++    previous: keyCodeCommands.moveToPreviousSpellingError,
++  },
++  listItem: {
++    next: keyCodeCommands.moveToNextListItem,
++    previous: keyCodeCommands.moveToPreviousListItem,
++  },
++  unvisitedLink: {
++    next: keyCodeCommands.moveToNextUnvisitedLink,
++    previous: keyCodeCommands.moveToPreviousUnvisitedLink,
++  },
++  nonLinkedText: {
++    next: keyCodeCommands.moveToNextNonLinkedText,
++    previous: keyCodeCommands.moveToPreviousNonLinkedText,
++  },
++  headingLevel1: {
++    next: keyCodeCommands.moveToNextHeadingLevel1,
++    previous: keyCodeCommands.moveToPreviousHeadingLevel1,
++  },
++  headingLevel2: {
++    next: keyCodeCommands.moveToNextHeadingLevel2,
++    previous: keyCodeCommands.moveToPreviousHeadingLevel2,
++  },
++  headingLevel3: {
++    next: keyCodeCommands.moveToNextHeadingLevel3,
++    previous: keyCodeCommands.moveToPreviousHeadingLevel3,
++  },
++  headingLevel4: {
++    next: keyCodeCommands.moveToNextHeadingLevel4,
++    previous: keyCodeCommands.moveToPreviousHeadingLevel4,
++  },
++  headingLevel5: {
++    next: keyCodeCommands.moveToNextHeadingLevel5,
++    previous: keyCodeCommands.moveToPreviousHeadingLevel5,
++  },
++  headingLevel6: {
++    next: keyCodeCommands.moveToNextHeadingLevel6,
++    previous: keyCodeCommands.moveToPreviousHeadingLevel6,
++  },
++};
++
++/**
++ * Get the NVDA keyboard command for navigating to the next or previous
++ * element of the specified type.
++ *
++ * @param elementType The element type to navigate by.
++ * @param direction   The navigation direction.
++ * @returns The keyboard command, or `null` if the element type is not supported.
++ */
++export function getNVDANavigationCommand(
++  elementType: string,
++  direction: "next" | "previous"
++): KeyCodeCommand | null {
++  const pair = elementCommands[elementType];
++
++  if (!pair) {
++    return null;
++  }
++
++  return pair[direction];
++}
