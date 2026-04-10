@@ -982,7 +982,7 @@ new file mode 100755
 index 0000000..398e14a
 --- /dev/null
 +++ b/test.sh
-@@ -0,0 +1,40 @@
+@@ -0,0 +1,39 @@
 +#!/usr/bin/env bash
 +set -euo pipefail
 +
@@ -1014,8 +1014,7 @@ index 0000000..398e14a
 +
 +if [ "$MODE" = "base" ]; then
 +  npx jest $JEST_ARGS \
-+    --testPathIgnorePatterns="navigateTo\\.test\\.ts" \
-+    --testPathIgnorePatterns="matchPattern\\.test\\.ts"
++    --testPathIgnorePatterns="(navigateTo|matchPattern)\\.test\\.ts"
 +elif [ "$MODE" = "new" ]; then
 +  npx jest $JEST_ARGS \
 +    --testPathPattern="(navigateTo|matchPattern)\\.test\\.ts"
