@@ -1077,7 +1077,7 @@ index 0000000..c8c4d2a
 +});
 diff --git a/test.sh b/test.sh
 new file mode 100755
-index 0000000..9599cd0
+index 0000000..6b63a10
 --- /dev/null
 +++ b/test.sh
 @@ -0,0 +1,41 @@
@@ -1113,10 +1113,10 @@ index 0000000..9599cd0
 +fi
 +
 +if [ "$MODE" = "base" ]; then
-+  npx jest $JEST_ARGS \
++  ./node_modules/.bin/jest $JEST_ARGS \
 +    --testPathIgnorePatterns="navigateTo"
 +elif [ "$MODE" = "new" ]; then
-+  npx jest $JEST_ARGS \
++  ./node_modules/.bin/jest $JEST_ARGS \
 +    --testPathPattern="navigateTo"
 +else
 +  echo "Usage: $0 [base|new] [--output_path <path>]" >&2
