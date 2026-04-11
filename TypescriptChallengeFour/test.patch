@@ -1,9 +1,9 @@
 diff --git a/src/macOS/VoiceOver/navigateTo.test.ts b/src/macOS/VoiceOver/navigateTo.test.ts
 new file mode 100644
-index 0000000..502d201
+index 0000000..b7b483f
 --- /dev/null
 +++ b/src/macOS/VoiceOver/navigateTo.test.ts
-@@ -0,0 +1,634 @@
+@@ -0,0 +1,608 @@
 +import {
 +  configureSettings,
 +  DEFAULT_GUIDEPUP_VOICEOVER_SETTINGS,
@@ -528,23 +528,16 @@ index 0000000..502d201
 +
 +    describe("logging parity with next/previous", () => {
 +      it("should record each forward navigation step in spokenPhraseLog", async () => {
-+        const spokenLog: string[] = [];
-+        const navPhrases = ["Step 1", "Step 2", "Target"];
-+        let navIdx = 0;
++        const phrases = ["Start", "Step 1", "Step 2", "Target"];
++        let callCount = 0;
 +
-+        VoiceOverCaptionStub.lastSpokenPhrase
-+          .mockResolvedValueOnce("Start")
-+          .mockResolvedValueOnce("Step 1")
-+          .mockResolvedValueOnce("Step 2")
-+          .mockResolvedValueOnce("Target");
-+
-+        VoiceOverCursorStub.next.mockImplementation(async () => {
-+          spokenLog.push(navPhrases[navIdx++]);
++        VoiceOverCaptionStub.lastSpokenPhrase.mockImplementation(async () => {
++          return phrases[callCount++];
 +        });
 +
-+        VoiceOverCaptionStub.spokenPhraseLog.mockImplementation(
-+          async () => [...spokenLog]
-+        );
++        VoiceOverCaptionStub.spokenPhraseLog.mockImplementation(async () => {
++          return phrases.slice(1, callCount);
++        });
 +
 +        const result = await vo.navigateTo("Target");
 +
@@ -554,23 +547,16 @@ index 0000000..502d201
 +      });
 +
 +      it("should record each forward navigation step in itemTextLog", async () => {
-+        const itemLog: string[] = [];
-+        const navPhrases = ["Step 1", "Step 2", "Target"];
-+        let navIdx = 0;
++        const phrases = ["Start", "Step 1", "Step 2", "Target"];
++        let callCount = 0;
 +
-+        VoiceOverCaptionStub.lastSpokenPhrase
-+          .mockResolvedValueOnce("Start")
-+          .mockResolvedValueOnce("Step 1")
-+          .mockResolvedValueOnce("Step 2")
-+          .mockResolvedValueOnce("Target");
-+
-+        VoiceOverCursorStub.next.mockImplementation(async () => {
-+          itemLog.push(navPhrases[navIdx++]);
++        VoiceOverCaptionStub.lastSpokenPhrase.mockImplementation(async () => {
++          return phrases[callCount++];
 +        });
 +
-+        VoiceOverCaptionStub.itemTextLog.mockImplementation(
-+          async () => [...itemLog]
-+        );
++        VoiceOverCaptionStub.itemTextLog.mockImplementation(async () => {
++          return phrases.slice(1, callCount);
++        });
 +
 +        const result = await vo.navigateTo("Target");
 +
@@ -580,60 +566,48 @@ index 0000000..502d201
 +      });
 +
 +      it("should record backward navigation steps in spokenPhraseLog", async () => {
-+        const spokenLog: string[] = [];
-+        const navPhrases = ["Prev 1", "Found"];
-+        let navIdx = 0;
++        const phrases = ["Start", "Prev 1", "Found"];
++        let callCount = 0;
 +
-+        VoiceOverCaptionStub.lastSpokenPhrase
-+          .mockResolvedValueOnce("Start")
-+          .mockResolvedValueOnce("Prev 1")
-+          .mockResolvedValueOnce("Found");
-+
-+        VoiceOverCursorStub.previous.mockImplementation(async () => {
-+          spokenLog.push(navPhrases[navIdx++]);
++        VoiceOverCaptionStub.lastSpokenPhrase.mockImplementation(async () => {
++          return phrases[callCount++];
 +        });
 +
-+        VoiceOverCaptionStub.spokenPhraseLog.mockImplementation(
-+          async () => [...spokenLog]
-+        );
++        VoiceOverCaptionStub.spokenPhraseLog.mockImplementation(async () => {
++          return phrases.slice(1, callCount);
++        });
 +
-+        await vo.navigateTo("Found", { direction: "previous" });
++        const result = await vo.navigateTo("Found", { direction: "previous" });
 +
 +        const log = await VoiceOverCaptionStub.spokenPhraseLog();
 +        expect(log).toStrictEqual(["Prev 1", "Found"]);
++        expect(log).toStrictEqual(result.visited);
 +      });
 +
 +      it("should record element type navigation steps in both logs", async () => {
-+        const spokenLog: string[] = [];
-+        const itemLog: string[] = [];
-+        const navPhrases = ["heading A", "heading Found"];
-+        let navIdx = 0;
++        const phrases = ["Start", "heading A", "heading Found"];
++        let callCount = 0;
 +
-+        VoiceOverCaptionStub.lastSpokenPhrase
-+          .mockResolvedValueOnce("Start")
-+          .mockResolvedValueOnce("heading A")
-+          .mockResolvedValueOnce("heading Found");
-+
-+        VoiceOverKeyboardStub.perform.mockImplementation(async () => {
-+          spokenLog.push(navPhrases[navIdx]);
-+          itemLog.push(navPhrases[navIdx]);
-+          navIdx++;
++        VoiceOverCaptionStub.lastSpokenPhrase.mockImplementation(async () => {
++          return phrases[callCount++];
 +        });
 +
-+        VoiceOverCaptionStub.spokenPhraseLog.mockImplementation(
-+          async () => [...spokenLog]
-+        );
-+        VoiceOverCaptionStub.itemTextLog.mockImplementation(
-+          async () => [...itemLog]
-+        );
++        VoiceOverCaptionStub.spokenPhraseLog.mockImplementation(async () => {
++          return phrases.slice(1, callCount);
++        });
++        VoiceOverCaptionStub.itemTextLog.mockImplementation(async () => {
++          return phrases.slice(1, callCount);
++        });
 +
-+        await vo.navigateTo("Found", { elementType: "heading" });
++        const result = await vo.navigateTo("Found", { elementType: "heading" });
 +
 +        const sLog = await VoiceOverCaptionStub.spokenPhraseLog();
 +        expect(sLog).toStrictEqual(["heading A", "heading Found"]);
++        expect(sLog).toStrictEqual(result.visited);
 +
 +        const iLog = await VoiceOverCaptionStub.itemTextLog();
 +        expect(iLog).toStrictEqual(["heading A", "heading Found"]);
++        expect(iLog).toStrictEqual(result.visited);
 +      });
 +    });
 +  });
@@ -714,10 +688,10 @@ index 0000000..1565bed
 +});
 diff --git a/src/windows/NVDA/navigateTo.test.ts b/src/windows/NVDA/navigateTo.test.ts
 new file mode 100644
-index 0000000..98fc3c7
+index 0000000..c8c4d2a
 --- /dev/null
 +++ b/src/windows/NVDA/navigateTo.test.ts
-@@ -0,0 +1,384 @@
+@@ -0,0 +1,383 @@
 +import {
 +  ERR_NVDA_NOT_RUNNING,
 +} from "../errors";
@@ -786,31 +760,30 @@ index 0000000..98fc3c7
 +  });
 +
 +  describe("when NVDA is running", () => {
-+    let capturedPhrases: string[];
-+    let phraseQueue: string[];
++    let fullSequence: string[];
++    let stepsDone: number;
 +
 +    function setUpPhrases(initial: string[], navigation: string[]) {
-+      capturedPhrases = [...initial];
-+      phraseQueue = [...navigation];
++      fullSequence = [...initial, ...navigation];
++      stepsDone = initial.length;
 +      NVDAClientStub.spokenPhraseLog.mockImplementation(() =>
-+        Promise.resolve([...capturedPhrases])
++        Promise.resolve(fullSequence.slice(0, stepsDone))
 +      );
 +    }
 +
 +    beforeEach(async () => {
-+      capturedPhrases = [];
-+      phraseQueue = [];
++      fullSequence = [];
++      stepsDone = 0;
 +
 +      NVDAClientStub.waitForSpokenPhrase.mockImplementation(
 +        async (action: () => Promise<unknown>) => {
 +          await action();
-+          const phrase = phraseQueue.shift() ?? "";
-+          capturedPhrases.push(phrase);
++          stepsDone++;
 +        }
 +      );
 +
 +      NVDAClientStub.spokenPhraseLog.mockImplementation(() =>
-+        Promise.resolve([...capturedPhrases])
++        Promise.resolve(fullSequence.slice(0, stepsDone))
 +      );
 +
 +      await nvda.start();
