@@ -691,7 +691,7 @@ new file mode 100644
 index 0000000..c8c4d2a
 --- /dev/null
 +++ b/src/windows/NVDA/navigateTo.test.ts
-@@ -0,0 +1,383 @@
+@@ -0,0 +1,420 @@
 +import {
 +  ERR_NVDA_NOT_RUNNING,
 +} from "../errors";
@@ -897,6 +897,32 @@ index 0000000..c8c4d2a
 +      });
 +    });
 +
++    describe("match option with itemText", () => {
++      it("should compare against itemText when match is itemText", async () => {
++        setUpPhrases(["Start"], ["Item 1", "Target Text"]);
++
++        const result = await nvda.navigateTo("target text", {
++          match: "itemText",
++        });
++
++        expect(result.found).toBe(true);
++        expect(result.phrase).toBe("Target Text");
++        expect(result.steps).toBe(2);
++        expect(result.visited).toStrictEqual(["Item 1", "Target Text"]);
++      });
++
++      it("should detect cycle using itemText when match is itemText", async () => {
++        setUpPhrases(["Start"], ["Other", "Start"]);
++
++        const result = await nvda.navigateTo("nonexistent", {
++          match: "itemText",
++        });
++
++        expect(result.found).toBe(false);
++        expect(result.steps).toBe(2);
++      });
++    });
++
 +    describe("RegExp target", () => {
 +      it("should find item matching regex", async () => {
 +        setUpPhrases(
@@ -1071,6 +1097,17 @@ index 0000000..c8c4d2a
 +        expect(result.steps).toBe(2);
 +        const log = await NVDAClientStub.spokenPhraseLog();
 +        expect(log).toStrictEqual(["Current", "Prev 1", "Found"]);
++      });
++
++      it("should accumulate itemTextLog entries identically to spokenPhraseLog", async () => {
++        setUpPhrases(["Start"], ["Step 1", "Step 2", "Target"]);
++
++        await nvda.navigateTo("Target");
++
++        const spokenLog = await NVDAClientStub.spokenPhraseLog();
++        const itemLog = await nvda.itemTextLog();
++
++        expect(itemLog).toStrictEqual(spokenLog);
 +      });
 +    });
 +  });
