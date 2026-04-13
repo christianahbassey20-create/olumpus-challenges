@@ -42,7 +42,7 @@ new file mode 100644
 index 0000000..44b2ba9
 --- /dev/null
 +++ b/tests/test_model_controller/test_bulk_operations.py
-@@ -0,0 +1,1253 @@
+@@ -0,0 +1,1249 @@
 +import typing as t
 +import pytest
 +from ninja_schema import ModelSchema
@@ -1133,18 +1133,14 @@ index 0000000..44b2ba9
 +    """Non-atomic mode falls back to status_code 500 for non-APIException errors."""
 +
 +    def test_unexpected_error_returns_500_status_code(self, monkeypatch):
-+        """A RuntimeError during update yields status_code 500, not 404."""
-+        from ninja_extra.controllers.model.service import ModelService
-+
++        """A RuntimeError during save yields status_code 500, not 404."""
 +        e1 = Event.objects.create(title="Err500", start_date="2024-01-01", end_date="2024-01-02")
 +        client = TestClient(EventBulkNonAtomicController)
 +
-+        original_update = ModelService.update
-+
-+        def exploding_update(self, instance, schema, **kwargs):
++        def exploding_save(self, *args, **kwargs):
 +            raise RuntimeError("unexpected DB failure")
 +
-+        monkeypatch.setattr(ModelService, "update", exploding_update)
++        monkeypatch.setattr(Event, "save", exploding_save)
 +
 +        payload = [
 +            {"id": e1.id, "title": "Boom", "start_date": "2025-01-01", "end_date": "2025-01-02"},
