@@ -4,8 +4,9 @@ WORKDIR /app
 
 COPY package.json yarn.lock ./
 
-RUN yarn install --frozen-lockfile || yarn install
-RUN yarn add --dev jest-junit
+RUN NODE_ENV=development npm install --legacy-peer-deps --no-optional || \
+    NODE_ENV=development npm install --legacy-peer-deps --ignore-scripts
+RUN NODE_ENV=development npm install --save-dev jest-junit --legacy-peer-deps
 
 COPY . .
 
